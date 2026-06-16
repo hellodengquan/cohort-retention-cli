@@ -17,6 +17,7 @@ from .config import (
     OutlierConfig,
     RollingWindowConfig,
     CompositeEventConfig,
+    RollingAlignment,
 )
 from .loaders import create_loader
 from .analyzer import CohortAnalyzer
@@ -27,11 +28,26 @@ from .dsl import CohortDSLEngine, DSLError
 def _parse_composite_events(events_str: Tuple[str, ...]) -> List[CompositeEventConfig]:
     events = []
     for ev_str in events_str:
-        parts = ev_str.split(":", 1)
-        if len(parts) != 2:
-            raise click.BadParameter(f"复合事件格式错误: {ev_str}，应为 'name:expression'")
-        name, expr = parts
-        events.append(CompositeEventConfig(name=name.strip(), expression=expr.strip()))
+        parts = ev_str.split(":")
+        if len(parts) < 2:
+            raise click.BadParameter(f"复合事件格式错误: {ev_str}，应为 'name:expression[:priority[:stop]]'")
+        name = parts[0].strip()
+        expr = parts[1].strip()
+        priority = 0
+        stop_on_match = False
+        if len(parts) >= 3:
+            try:
+                priority = int(parts[2].strip())
+            except ValueError:
+                raise click.BadParameter(f"优先级必须是整数: {parts[2]}")
+        if len(parts) >= 4:
+            stop_on_match = parts[3].strip().lower() in ("true", "1", "yes", "stop")
+        events.append(CompositeEventConfig(
+            name=name,
+            expression=expr,
+            priority=priority,
+            stop_on_match=stop_on_match,
+        ))
     return events
 
 
@@ -49,28 +65,48 @@ def _build_cohort_config(
     dsl_cohort: str,
     dsl_filter: str,
     dsl_segment: str,
+    dsl_error_recovery: bool,
+    dsl_default_numeric: float,
     outlier_enabled: bool,
     outlier_method: str,
     outlier_threshold: float,
+    outlier_percentile_low: float,
+    outlier_percentile_high: float,
+    outlier_mad_threshold: float,
+    outlier_contamination: float,
+    outlier_eps: float,
+    outlier_min_samples: int,
     outlier_remove_users: bool,
     outlier_remove_cohorts: bool,
+    outlier_target_col: str,
     rolling_enabled: bool,
     rolling_window: int,
     rolling_step: int,
     rolling_min_periods: int,
+    rolling_alignment: str,
+    rolling_include_partial: bool,
 ) -> CohortConfig:
     dsl_config = CohortDSLConfig(
         cohort_expression=dsl_cohort if dsl_cohort else None,
         filter_expression=dsl_filter if dsl_filter else None,
         segment_expression=dsl_segment if dsl_segment else None,
+        error_recovery=dsl_error_recovery,
+        default_numeric=dsl_default_numeric,
     )
 
     outlier_config = OutlierConfig(
         enabled=outlier_enabled,
         method=OutlierMethod(outlier_method),
         threshold=outlier_threshold,
+        percentile_low=outlier_percentile_low,
+        percentile_high=outlier_percentile_high,
+        mad_threshold=outlier_mad_threshold,
+        contamination=outlier_contamination,
+        eps=outlier_eps,
+        min_samples=outlier_min_samples,
         remove_users=outlier_remove_users,
         remove_cohorts=outlier_remove_cohorts,
+        target_column=outlier_target_col if outlier_target_col else None,
     )
 
     rolling_config = RollingWindowConfig(
@@ -78,6 +114,8 @@ def _build_cohort_config(
         window_size=rolling_window,
         step=rolling_step,
         min_periods=rolling_min_periods,
+        alignment=RollingAlignment(rolling_alignment),
+        include_partial=rolling_include_partial,
     )
 
     composite_configs = _parse_composite_events(composite_events) if composite_events else []
@@ -129,11 +167,29 @@ def _build_report_config(
     output_dir: str,
     formats: tuple,
     matrix_format: str,
+    ssr_enabled: bool = True,
+    ssr_render_charts: bool = True,
+    ssr_embed_data: bool = True,
+    ssr_minify: bool = False,
+    parquet_spark_compatible: bool = True,
+    parquet_compression: str = "snappy",
 ) -> ReportConfig:
+    from .config import ParquetConfig
+
+    parquet_cfg = ParquetConfig(
+        spark_compatible=parquet_spark_compatible,
+        compression=parquet_compression,
+    )
+
     return ReportConfig(
         output_dir=output_dir,
         formats=list(formats),
         matrix_format=matrix_format,
+        ssr_enabled=ssr_enabled,
+        ssr_render_charts=ssr_render_charts,
+        ssr_embed_data=ssr_embed_data,
+        ssr_minify=ssr_minify,
+        parquet=parquet_cfg,
     )
 
 
@@ -168,15 +224,32 @@ def cli():
 @click.option("--dsl-cohort", default=None, help="DSL 分群时间表达式")
 @click.option("--dsl-filter", default=None, help="DSL 过滤表达式")
 @click.option("--dsl-segment", default=None, help="DSL 分段表达式")
+@click.option("--dsl-error-recovery/--no-dsl-error-recovery", default=True, help="DSL 错误恢复")
+@click.option("--dsl-default-numeric", default=0.0, type=float, help="DSL 数值默认值")
 @click.option("--outlier-enabled/--outlier-disabled", default=False, help="是否启用异常值剔除")
-@click.option("--outlier-method", type=click.Choice(["iqr", "zscore", "percentile"]), default="iqr", help="异常值检测方法")
+@click.option("--outlier-method", type=click.Choice(["iqr", "zscore", "percentile", "mad", "isolation_forest", "dbscan"]), default="iqr", help="异常值检测方法")
 @click.option("--outlier-threshold", default=1.5, type=float, help="异常值检测阈值")
+@click.option("--outlier-percentile-low", default=1.0, type=float, help="百分位数法下限")
+@click.option("--outlier-percentile-high", default=99.0, type=float, help="百分位数法上限")
+@click.option("--outlier-mad-threshold", default=3.0, type=float, help="MAD 方法阈值")
+@click.option("--outlier-contamination", default=0.05, type=float, help="Isolation Forest 污染率")
+@click.option("--outlier-eps", default=0.5, type=float, help="DBSCAN eps 参数")
+@click.option("--outlier-min-samples", default=5, type=int, help="DBSCAN min_samples 参数")
 @click.option("--outlier-remove-users/--no-outlier-remove-users", default=False, help="是否移除异常用户")
 @click.option("--outlier-remove-cohorts/--no-outlier-remove-cohorts", default=True, help="是否移除异常队列")
+@click.option("--outlier-target-col", default=None, help="异常值检测目标列")
 @click.option("--rolling-enabled/--rolling-disabled", default=False, help="是否启用滚动留存窗")
 @click.option("--rolling-window", default=7, type=int, help="滚动窗口大小（天）")
 @click.option("--rolling-step", default=1, type=int, help="滚动步长（天）")
 @click.option("--rolling-min-periods", default=1, type=int, help="滚动最小观测期")
+@click.option("--rolling-alignment", type=click.Choice(["left", "center", "right"]), default="left", help="滚动窗口对齐方式")
+@click.option("--rolling-include-partial/--no-rolling-include-partial", default=False, help="是否包含不完整窗口")
+@click.option("--ssr-enabled/--no-ssr-enabled", default=True, help="HTML 报告 SSR 启用")
+@click.option("--ssr-render-charts/--no-ssr-render-charts", default=True, help="SSR 渲染图表")
+@click.option("--ssr-embed-data/--no-ssr-embed-data", default=True, help="SSR 嵌入数据")
+@click.option("--ssr-minify/--no-ssr-minify", default=False, help="SSR 压缩 HTML")
+@click.option("--parquet-spark-compatible/--no-parquet-spark-compatible", default=True, help="Parquet Spark 兼容")
+@click.option("--parquet-compression", type=click.Choice(["snappy", "gzip", "brotli", "lz4", "zstd", "none"]), default="snappy", help="Parquet 压缩格式")
 @click.option("--output-dir", default="./reports", help="报告输出目录")
 @click.option("--format", "formats", type=click.Choice(["markdown", "json", "html"]), multiple=True, default=["markdown", "json"], help="报告格式")
 @click.option("--matrix-format", type=click.Choice(["csv", "parquet"]), default="csv", help="矩阵导出格式")
@@ -205,15 +278,32 @@ def analyze(
     dsl_cohort,
     dsl_filter,
     dsl_segment,
+    dsl_error_recovery,
+    dsl_default_numeric,
     outlier_enabled,
     outlier_method,
     outlier_threshold,
+    outlier_percentile_low,
+    outlier_percentile_high,
+    outlier_mad_threshold,
+    outlier_contamination,
+    outlier_eps,
+    outlier_min_samples,
     outlier_remove_users,
     outlier_remove_cohorts,
+    outlier_target_col,
     rolling_enabled,
     rolling_window,
     rolling_step,
     rolling_min_periods,
+    rolling_alignment,
+    rolling_include_partial,
+    ssr_enabled,
+    ssr_render_charts,
+    ssr_embed_data,
+    ssr_minify,
+    parquet_spark_compatible,
+    parquet_compression,
     output_dir,
     formats,
     matrix_format,
@@ -236,15 +326,26 @@ def analyze(
             dsl_cohort=dsl_cohort,
             dsl_filter=dsl_filter,
             dsl_segment=dsl_segment,
+            dsl_error_recovery=dsl_error_recovery,
+            dsl_default_numeric=dsl_default_numeric,
             outlier_enabled=outlier_enabled,
             outlier_method=outlier_method,
             outlier_threshold=outlier_threshold,
+            outlier_percentile_low=outlier_percentile_low,
+            outlier_percentile_high=outlier_percentile_high,
+            outlier_mad_threshold=outlier_mad_threshold,
+            outlier_contamination=outlier_contamination,
+            outlier_eps=outlier_eps,
+            outlier_min_samples=outlier_min_samples,
             outlier_remove_users=outlier_remove_users,
             outlier_remove_cohorts=outlier_remove_cohorts,
+            outlier_target_col=outlier_target_col,
             rolling_enabled=rolling_enabled,
             rolling_window=rolling_window,
             rolling_step=rolling_step,
             rolling_min_periods=rolling_min_periods,
+            rolling_alignment=rolling_alignment,
+            rolling_include_partial=rolling_include_partial,
         )
 
         source_config = _build_source_config(
@@ -264,6 +365,12 @@ def analyze(
             output_dir=output_dir,
             formats=formats,
             matrix_format=matrix_format,
+            ssr_enabled=ssr_enabled,
+            ssr_render_charts=ssr_render_charts,
+            ssr_embed_data=ssr_embed_data,
+            ssr_minify=ssr_minify,
+            parquet_spark_compatible=parquet_spark_compatible,
+            parquet_compression=parquet_compression,
         )
 
         errors = source_config.validate() + cohort_config.validate() + report_config.validate()

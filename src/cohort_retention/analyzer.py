@@ -36,22 +36,75 @@ class OutlierRemover:
         return zscores > self.config.threshold
 
     def _detect_percentile(self, values: np.ndarray) -> np.ndarray:
-        lower_p = self.config.threshold * 100
-        upper_p = 100 - self.config.threshold * 100
-        lower, upper = np.percentile(values, [lower_p, upper_p])
+        lower, upper = np.percentile(values, [self.config.percentile_low, self.config.percentile_high])
         return (values < lower) | (values > upper)
 
-    def remove_outliers(self, df: pd.DataFrame, value_col: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    def _detect_mad(self, values: np.ndarray) -> np.ndarray:
+        median = np.median(values)
+        mad = np.median(np.abs(values - median))
+        if mad == 0:
+            return np.zeros_like(values, dtype=bool)
+        modified_zscores = 0.6745 * np.abs(values - median) / mad
+        return modified_zscores > self.config.mad_threshold
+
+    def _detect_isolation_forest(self, values: np.ndarray) -> np.ndarray:
+        try:
+            from sklearn.ensemble import IsolationForest
+        except ImportError:
+            raise ImportError(
+                "Isolation Forest 需要 scikit-learn，请运行: pip install scikit-learn"
+            )
+
+        X = values.reshape(-1, 1)
+        iso = IsolationForest(
+            contamination=self.config.contamination,
+            random_state=42,
+        )
+        preds = iso.fit_predict(X)
+        return preds == -1
+
+    def _detect_dbscan(self, values: np.ndarray) -> np.ndarray:
+        try:
+            from sklearn.cluster import DBSCAN
+        except ImportError:
+            raise ImportError(
+                "DBSCAN 需要 scikit-learn，请运行: pip install scikit-learn"
+            )
+
+        X = values.reshape(-1, 1)
+        dbscan = DBSCAN(
+            eps=self.config.eps,
+            min_samples=self.config.min_samples,
+        )
+        labels = dbscan.fit_predict(X)
+        return labels == -1
+
+    def remove_outliers(
+        self,
+        df: pd.DataFrame,
+        value_col: Optional[str] = None,
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         if not self.config.enabled:
             return df, {"removed": 0, "method": None}
 
-        values = df[value_col].values
+        target_col = value_col or self.config.target_column
+        if not target_col:
+            raise ValueError("异常值检测需要指定 value_col 或 target_column")
+
+        values = df[target_col].values
+
         if self.config.method == OutlierMethod.IQR:
             mask = self._detect_iqr(values)
         elif self.config.method == OutlierMethod.ZSCORE:
             mask = self._detect_zscore(values)
         elif self.config.method == OutlierMethod.PERCENTILE:
             mask = self._detect_percentile(values)
+        elif self.config.method == OutlierMethod.MAD:
+            mask = self._detect_mad(values)
+        elif self.config.method == OutlierMethod.ISOLATION_FOREST:
+            mask = self._detect_isolation_forest(values)
+        elif self.config.method == OutlierMethod.DBSCAN:
+            mask = self._detect_dbscan(values)
         else:
             raise ValueError(f"未知的异常值检测方法: {self.config.method}")
 
@@ -64,7 +117,19 @@ class OutlierRemover:
             "threshold": self.config.threshold,
             "original_count": len(df),
             "remaining_count": len(cleaned_df),
+            "target_column": target_col,
         }
+
+        if self.config.method == OutlierMethod.MAD:
+            stats["mad_threshold"] = self.config.mad_threshold
+        elif self.config.method == OutlierMethod.PERCENTILE:
+            stats["percentile_low"] = self.config.percentile_low
+            stats["percentile_high"] = self.config.percentile_high
+        elif self.config.method == OutlierMethod.ISOLATION_FOREST:
+            stats["contamination"] = self.config.contamination
+        elif self.config.method == OutlierMethod.DBSCAN:
+            stats["eps"] = self.config.eps
+            stats["min_samples"] = self.config.min_samples
 
         return cleaned_df, stats
 
@@ -114,17 +179,32 @@ class CohortAnalyzer:
         if event_type_col not in df.columns:
             df[event_type_col] = self.config.event_type.value
 
-        composite_names = [ce.name for ce in self.config.composite_events]
+        sorted_events = sorted(
+            self.config.composite_events,
+            key=lambda x: x.priority,
+            reverse=True,
+        )
+
+        remaining_indices = set(df.index)
         all_comp_rows = []
 
-        for comp_event in self.config.composite_events:
+        for comp_event in sorted_events:
+            if not remaining_indices:
+                break
+
+            remaining_df = df.loc[list(remaining_indices)].copy()
+
             try:
                 from .dsl import DSLParser
-                mask = DSLParser.evaluate(comp_event.expression, {}, df)
+                mask = DSLParser.evaluate(comp_event.expression, {}, remaining_df)
                 if isinstance(mask, (pd.Series, np.ndarray)) and mask.any():
-                    comp_rows = df[mask].copy()
+                    matched_indices = remaining_df[mask].index
+                    comp_rows = remaining_df.loc[matched_indices].copy()
                     comp_rows[event_type_col] = comp_event.name
                     all_comp_rows.append(comp_rows)
+
+                    if comp_event.stop_on_match:
+                        remaining_indices -= set(matched_indices)
             except Exception as e:
                 raise ValueError(f"复合事件 {comp_event.name} 表达式计算失败: {e}")
 
@@ -185,11 +265,15 @@ class CohortAnalyzer:
         return cohort_sizes
 
     def _compute_rolling_retention(self, base: pd.DataFrame, cohort_sizes: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame, List[int]]:
+        from .config import RollingAlignment
+
         user_col = self.config.user_id_col
         window_size = self.config.rolling.window_size
         step = self.config.rolling.step
         min_periods = self.config.rolling.min_periods
         max_days = self.config.retention_days
+        alignment = self.config.rolling.alignment
+        include_partial = self.config.rolling.include_partial
 
         rolling_days = list(range(0, max_days + 1, step))
 
@@ -204,22 +288,39 @@ class CohortAnalyzer:
             dtype=float,
         )
 
+        half_window = window_size // 2
+
         for cohort_period in sorted(cohort_sizes.index):
             cohort_data = base[base["cohort_period"] == cohort_period]
             cohort_size = cohort_sizes[cohort_period]
 
             for day in rolling_days:
-                window_start = max(0, day - window_size + 1)
-                window_end = day + 1
+                if alignment == RollingAlignment.LEFT:
+                    window_start = day
+                    window_end = day + window_size
+                elif alignment == RollingAlignment.CENTER:
+                    window_start = day - half_window
+                    window_end = day + window_size - half_window
+                elif alignment == RollingAlignment.RIGHT:
+                    window_start = day - window_size + 1
+                    window_end = day + 1
+                else:
+                    window_start = day
+                    window_end = day + window_size
 
-                window_users = cohort_data[
-                    (cohort_data["days_since_cohort"] >= window_start)
-                    & (cohort_data["days_since_cohort"] < window_end)
+                actual_start = max(0, window_start)
+                actual_end = min(max_days + 1, window_end)
+                actual_window_size = actual_end - actual_start
+
+                if not include_partial and actual_window_size < window_size:
+                    window_users = np.nan
+                else:
+                    window_users = cohort_data[
+                        (cohort_data["days_since_cohort"] >= actual_start)
+                        & (cohort_data["days_since_cohort"] < actual_end)
                     ][user_col].nunique()
 
-                if day < window_size:
-                    actual_days = day + 1
-                    if actual_days < min_periods:
+                    if actual_window_size < min_periods:
                         window_users = np.nan
 
                 retention_counts.loc[cohort_period, day] = window_users

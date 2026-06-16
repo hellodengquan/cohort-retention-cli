@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-from ..models import CohortAnalysisResult
+from ..models import CohortAnalysisResult, RetentionMatrix
 from ..config import ReportConfig
 
 
@@ -182,6 +182,110 @@ class HtmlReporter:
         b = int(150 * v + 50)
         return f"rgb({r}, {g}, {b})"
 
+    def _generate_retention_chart_svg(self, matrix: RetentionMatrix) -> str:
+        if not self.config.ssr_render_charts:
+            return ""
+
+        dates = matrix.cohort_dates
+        days = matrix.days
+        rates = matrix.retention_rates
+
+        width = 800
+        height = 400
+        padding = {"left": 60, "right": 20, "top": 40, "bottom": 60}
+        chart_w = width - padding["left"] - padding["right"]
+        chart_h = height - padding["top"] - padding["bottom"]
+
+        svg_parts = [f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">']
+        svg_parts.append(f'<text x="{width/2}" y="25" text-anchor="middle" font-size="16" font-weight="bold" fill="#333">各队列留存曲线</text>')
+
+        colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", "#e67e22", "#34495e"]
+
+        max_day = max(days) if days else 1
+        x_step = chart_w / max_day
+
+        svg_parts.append(f'<line x1="{padding["left"]}" y1="{padding["top"]+chart_h}" x2="{padding["left"]+chart_w}" y2="{padding["top"]+chart_h}" stroke="#ccc" stroke-width="1"/>')
+        svg_parts.append(f'<line x1="{padding["left"]}" y1="{padding["top"]}" x2="{padding["left"]}" y2="{padding["top"]+chart_h}" stroke="#ccc" stroke-width="1"/>')
+
+        for i in range(0, 101, 20):
+            y = padding["top"] + chart_h - (i / 100 * chart_h)
+            svg_parts.append(f'<line x1="{padding["left"]}" y1="{y}" x2="{padding["left"]+chart_w}" y2="{y}" stroke="#eee" stroke-width="1"/>')
+            svg_parts.append(f'<text x="{padding["left"]-5}" y="{y+4}" text-anchor="end" font-size="11" fill="#666">{i}%</text>')
+
+        for d in [0, 7, 14, 30, 60, 90]:
+            if d <= max_day:
+                x = padding["left"] + (d / max_day * chart_w)
+                svg_parts.append(f'<text x="{x}" y="{padding["top"]+chart_h+20}" text-anchor="middle" font-size="11" fill="#666">Day {d}</text>')
+
+        for i, (date, row) in enumerate(rates.iterrows()):
+            color = colors[i % len(colors)]
+            points = []
+            for day in days:
+                if day in row.index and pd.notna(row[day]):
+                    x = padding["left"] + (day / max_day * chart_w)
+                    y = padding["top"] + chart_h - (row[day] * chart_h)
+                    points.append(f"{x},{y}")
+
+            if points:
+                date_str = dates[i].strftime("%Y-%m-%d") if i < len(dates) else str(i)
+                svg_parts.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="2"/>')
+                for p in points:
+                    x, y = p.split(",")
+                    svg_parts.append(f'<circle cx="{x}" cy="{y}" r="3" fill="{color}"/>')
+
+                legend_y = padding["top"] + i * 20
+                svg_parts.append(f'<rect x="{padding["left"]+10}" y="{legend_y}" width="12" height="12" fill="{color}"/>')
+                svg_parts.append(f'<text x="{padding["left"]+28}" y="{legend_y+10}" font-size="11" fill="#333">{date_str}</text>')
+
+        svg_parts.append("</svg>")
+        return "\n".join(svg_parts)
+
+    def _generate_funnel_svg(self, result: CohortAnalysisResult) -> str:
+        if not self.config.ssr_render_charts or not result.funnel:
+            return ""
+
+        width = 600
+        height = 300
+        padding = {"left": 20, "right": 20, "top": 40, "bottom": 40}
+
+        svg_parts = [f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">']
+        svg_parts.append(f'<text x="{width/2}" y="25" text-anchor="middle" font-size="16" font-weight="bold" fill="#333">留存漏斗图</text>')
+
+        colors = ["#2ecc71", "#27ae60", "#3498db", "#2980b9", "#9b59b6", "#8e44ad", "#e67e22", "#d35400"]
+        steps = result.funnel.steps
+        max_count = max(s.user_count for s in steps) if steps else 1
+        bar_h = (height - padding["top"] - padding["bottom"]) / len(steps)
+        bar_w_max = width - padding["left"] - padding["right"]
+
+        for i, step in enumerate(steps):
+            color = colors[i % len(colors)]
+            bar_w = (step.user_count / max_count) * bar_w_max
+            x = padding["left"]
+            y = padding["top"] + i * bar_h + 5
+
+            svg_parts.append(f'<rect x="{x}" y="{y}" width="{max(bar_w, 10)}" height="{bar_h-10}" fill="{color}" rx="4"/>')
+            svg_parts.append(f'<text x="{x+10}" y="{y+bar_h/2}" font-size="12" fill="white" font-weight="bold">{step.name}</text>')
+            svg_parts.append(f'<text x="{x+bar_w+10}" y="{y+bar_h/2+4}" font-size="11" fill="#333">{self._fmt_int(step.user_count)} ({self._fmt_pct(step.conversion_rate)})</text>')
+
+        svg_parts.append("</svg>")
+        return "\n".join(svg_parts)
+
+    def _embed_data_json(self, result: CohortAnalysisResult) -> str:
+        if not self.config.ssr_embed_data:
+            return ""
+        data = result.to_dict()
+        json_str = json.dumps(data, ensure_ascii=False, default=str)
+        escaped_json = json_str.replace("</script>", "<\\/script>")
+        return f'<script id="cohort-data" type="application/json">{escaped_json}</script>'
+
+    def _minify_html(self, html: str) -> str:
+        if not self.config.ssr_minify:
+            return html
+        import re
+        html = re.sub(r">\s+<", "><", html)
+        html = re.sub(r"\s+", " ", html)
+        return html.strip()
+
     def generate(self, result: CohortAnalysisResult) -> str:
         matrix = result.matrix
         config = result.config or {}
@@ -316,7 +420,22 @@ class HtmlReporter:
         html_parts.append("</table>")
         html_parts.append("</div>")
 
-        html_parts.append("<h2>6. 各队列规模</h2>")
+        if self.config.ssr_enabled:
+            retention_svg = self._generate_retention_chart_svg(matrix)
+            if retention_svg:
+                html_parts.append("<h2>6. 留存曲线图（SSR）</h2>")
+                html_parts.append('<div class="chart-container">')
+                html_parts.append(retention_svg)
+                html_parts.append("</div>")
+
+            funnel_svg = self._generate_funnel_svg(result)
+            if funnel_svg:
+                html_parts.append("<h2>7. 漏斗图（SSR）</h2>")
+                html_parts.append('<div class="chart-container">')
+                html_parts.append(funnel_svg)
+                html_parts.append("</div>")
+
+        html_parts.append("<h2>8. 各队列规模</h2>" if self.config.ssr_enabled else "<h2>6. 各队列规模</h2>")
         html_parts.append('<table style="max-width: 400px;">')
         html_parts.append("<tr><th>分群日期</th><th>用户数</th></tr>")
         for d in matrix.cohort_dates:
@@ -324,11 +443,19 @@ class HtmlReporter:
             html_parts.append(f"<tr><td>{d.strftime('%Y-%m-%d')}</td><td>{self._fmt_int(size)}</td></tr>")
         html_parts.append("</table>")
 
+        if self.config.ssr_enabled:
+            data_script = self._embed_data_json(result)
+            if data_script:
+                html_parts.append(data_script)
+
         html_parts.append("</div>")
         html_parts.append("</body>")
         html_parts.append("</html>")
 
-        return "\n".join(html_parts)
+        content = "\n".join(html_parts)
+        if self.config.ssr_minify:
+            content = self._minify_html(content)
+        return content
 
     def save(self, result: CohortAnalysisResult, filename: Optional[str] = None) -> str:
         Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
@@ -380,24 +507,84 @@ class MatrixExporter:
         df.to_csv(filepath, encoding="utf-8")
         return filepath
 
-    def export_counts_parquet(self, result: CohortAnalysisResult, filename: Optional[str] = None) -> str:
+    def _prepare_parquet_df(self, df: pd.DataFrame, spark_compatible: bool) -> pd.DataFrame:
+        if not spark_compatible:
+            return df
+
+        df = df.copy()
+        parquet_cfg = self.config.parquet
+
+        for col in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                if parquet_cfg.coerce_timestamps == "ms":
+                    df[col] = df[col].astype("datetime64[ms]")
+                elif parquet_cfg.coerce_timestamps == "us":
+                    df[col] = df[col].astype("datetime64[us]")
+
+            if pd.api.types.is_object_dtype(df[col]):
+                try:
+                    df[col] = df[col].astype(str)
+                except Exception:
+                    pass
+
+        return df
+
+    def export_counts_parquet(
+        self,
+        result: CohortAnalysisResult,
+        filename: Optional[str] = None,
+        spark_compatible: Optional[bool] = None,
+    ) -> str:
         Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
         if not filename:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"retention_counts_{timestamp}.parquet"
         filepath = os.path.join(self.config.output_dir, filename)
         df = self._prepare_df(result, is_counts=True)
-        df.to_parquet(filepath)
+
+        use_spark = spark_compatible if spark_compatible is not None else self.config.parquet.spark_compatible
+        if use_spark:
+            df = self._prepare_parquet_df(df, use_spark)
+
+        parquet_cfg = self.config.parquet
+        kwargs = {
+            "compression": parquet_cfg.compression,
+            "use_deprecated_int96_timestamps": parquet_cfg.use_deprecated_int96_timestamps,
+            "coerce_timestamps": parquet_cfg.coerce_timestamps,
+        }
+        if parquet_cfg.row_group_size:
+            kwargs["row_group_size"] = parquet_cfg.row_group_size
+
+        df.to_parquet(filepath, **kwargs)
         return filepath
 
-    def export_rates_parquet(self, result: CohortAnalysisResult, filename: Optional[str] = None) -> str:
+    def export_rates_parquet(
+        self,
+        result: CohortAnalysisResult,
+        filename: Optional[str] = None,
+        spark_compatible: Optional[bool] = None,
+    ) -> str:
         Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
         if not filename:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"retention_rates_{timestamp}.parquet"
         filepath = os.path.join(self.config.output_dir, filename)
         df = self._prepare_df(result, is_counts=False)
-        df.to_parquet(filepath)
+
+        use_spark = spark_compatible if spark_compatible is not None else self.config.parquet.spark_compatible
+        if use_spark:
+            df = self._prepare_parquet_df(df, use_spark)
+
+        parquet_cfg = self.config.parquet
+        kwargs = {
+            "compression": parquet_cfg.compression,
+            "use_deprecated_int96_timestamps": parquet_cfg.use_deprecated_int96_timestamps,
+            "coerce_timestamps": parquet_cfg.coerce_timestamps,
+        }
+        if parquet_cfg.row_group_size:
+            kwargs["row_group_size"] = parquet_cfg.row_group_size
+
+        df.to_parquet(filepath, **kwargs)
         return filepath
 
 
