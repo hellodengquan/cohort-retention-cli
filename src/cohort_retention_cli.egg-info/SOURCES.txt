@@ -3,10 +3,13 @@ src/cohort_retention/__init__.py
 src/cohort_retention/analyzer.py
 src/cohort_retention/cli.py
 src/cohort_retention/config.py
+src/cohort_retention/dsl.py
 src/cohort_retention/models.py
 src/cohort_retention/loaders/__init__.py
 src/cohort_retention/loaders/base.py
 src/cohort_retention/loaders/csv_loader.py
+src/cohort_retention/loaders/parquet_loader.py
+src/cohort_retention/loaders/postgresql_loader.py
 src/cohort_retention/loaders/sqlite_loader.py
 src/cohort_retention/reporters/__init__.py
 src/cohort_retention_cli.egg-info/PKG-INFO

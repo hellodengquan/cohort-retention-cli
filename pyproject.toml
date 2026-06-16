@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cohort-retention-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "留存队列分析 CLI - 按用户首单或注册时间分组，统计后续 N 天回流比例与漏斗"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -17,6 +17,11 @@ dependencies = [
     "pandas>=1.5.0",
     "numpy>=1.23.0",
 ]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=10.0.0"]
+postgresql = ["psycopg2-binary>=2.9.0", "sqlalchemy>=2.0.0"]
+full = ["pyarrow>=10.0.0", "psycopg2-binary>=2.9.0", "sqlalchemy>=2.0.0"]
 
 [project.scripts]
 cohort = "cohort_retention.cli:cli"

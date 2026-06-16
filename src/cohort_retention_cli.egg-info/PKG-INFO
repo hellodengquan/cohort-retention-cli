@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: cohort-retention-cli
-Version: 0.1.0
+Version: 0.2.0
 Summary: 留存队列分析 CLI - 按用户首单或注册时间分组，统计后续 N 天回流比例与漏斗
 Author: Cohort Team
 License: MIT
@@ -9,3 +9,12 @@ Description-Content-Type: text/markdown
 Requires-Dist: click>=8.1.0
 Requires-Dist: pandas>=1.5.0
 Requires-Dist: numpy>=1.23.0
+Provides-Extra: parquet
+Requires-Dist: pyarrow>=10.0.0; extra == "parquet"
+Provides-Extra: postgresql
+Requires-Dist: psycopg2-binary>=2.9.0; extra == "postgresql"
+Requires-Dist: sqlalchemy>=2.0.0; extra == "postgresql"
+Provides-Extra: full
+Requires-Dist: pyarrow>=10.0.0; extra == "full"
+Requires-Dist: psycopg2-binary>=2.9.0; extra == "full"
+Requires-Dist: sqlalchemy>=2.0.0; extra == "full"

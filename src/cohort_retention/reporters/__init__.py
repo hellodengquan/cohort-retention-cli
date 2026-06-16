@@ -5,6 +5,7 @@ from typing import Optional
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 
 from ..models import CohortAnalysisResult
 from ..config import ReportConfig
@@ -32,11 +33,12 @@ class MarkdownReporter:
         if result.config:
             lines.append("| 配置项 | 值 |")
             lines.append("|--------|----|")
-            lines.append(f"| 分群依据 | {result.config.get('cohort_key', '-')} |")
-            lines.append(f"| 时间粒度 | {result.config.get('granularity', '-')} |")
-            lines.append(f"| 留存天数 | {result.config.get('retention_days', '-')} |")
-            lines.append(f"| 事件类型 | {result.config.get('event_type', '-')} |")
-            lines.append(f"| 最小用户数 | {result.config.get('min_users', '-')} |")
+            for k, v in result.config.items():
+                if isinstance(v, dict):
+                    v_str = json.dumps(v, ensure_ascii=False)
+                else:
+                    v_str = str(v)
+                lines.append(f"| {k} | {v_str} |")
         lines.append("")
 
         lines.append("## 2. 总体概览")
@@ -54,6 +56,13 @@ class MarkdownReporter:
                 for day_key, rate in sorted_days:
                     day_num = day_key.replace("day_", "")
                     lines.append(f"  - 第 {day_num} 天: {self._fmt_pct(rate)}")
+            outlier_stats = result.summary.get("outlier_stats")
+            if outlier_stats:
+                lines.append("- **异常值统计**:")
+                lines.append(f"  - 检测方法: {outlier_stats.get('method', '-')}")
+                lines.append(f"  - 移除用户数: {outlier_stats.get('removed', 0)}")
+                if "cohorts_removed" in outlier_stats:
+                    lines.append(f"  - 移除队列数: {outlier_stats.get('cohorts_removed', 0)}")
         lines.append("")
 
         lines.append("## 3. 留存漏斗")
@@ -154,37 +163,242 @@ class JsonReporter:
         return filepath
 
 
-class MatrixExporter:
+class HtmlReporter:
     def __init__(self, config: ReportConfig):
         self.config = config
 
-    def export_counts_csv(self, result: CohortAnalysisResult, filename: Optional[str] = None) -> str:
+    def _fmt_pct(self, value: float) -> str:
+        return f"{value * 100:.2f}%"
+
+    def _fmt_int(self, value) -> str:
+        return f"{int(value):,}"
+
+    def _get_heatmap_color(self, value: float) -> str:
+        if pd.isna(value):
+            return "#f5f5f5"
+        v = max(0.0, min(1.0, float(value)))
+        r = int(255 * (1 - v))
+        g = int(200 * v + 55)
+        b = int(150 * v + 50)
+        return f"rgb({r}, {g}, {b})"
+
+    def generate(self, result: CohortAnalysisResult) -> str:
+        matrix = result.matrix
+        config = result.config or {}
+        summary = result.summary or {}
+
+        counts_df = matrix.retention_counts.copy()
+        counts_df.index = [d.strftime("%Y-%m-%d") for d in matrix.cohort_dates]
+        counts_df.columns = [f"Day {d}" for d in matrix.days]
+
+        rates_df = matrix.retention_rates.copy()
+        rates_df.index = [d.strftime("%Y-%m-%d") for d in matrix.cohort_dates]
+        rates_df.columns = [f"Day {d}" for d in matrix.days]
+
+        html_parts = []
+        html_parts.append("<!DOCTYPE html>")
+        html_parts.append('<html lang="zh-CN">')
+        html_parts.append("<head>")
+        html_parts.append('<meta charset="UTF-8">')
+        html_parts.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">')
+        html_parts.append("<title>留存队列分析报告</title>")
+        html_parts.append("<style>")
+        html_parts.append("""
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 20px; background: #fafafa; color: #333; }
+            .container { max-width: 1400px; margin: 0 auto; }
+            h1 { color: #2c3e50; margin-bottom: 10px; }
+            h2 { color: #34495e; margin-top: 30px; margin-bottom: 15px; border-bottom: 2px solid #3498db; padding-bottom: 5px; }
+            .metadata { color: #7f8c8d; margin-bottom: 20px; }
+            table { border-collapse: collapse; width: 100%; margin-bottom: 20px; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+            th, td { padding: 10px 12px; text-align: right; border: 1px solid #ecf0f1; }
+            th { background: #3498db; color: white; font-weight: 600; }
+            tr:nth-child(even) { background: #f8f9fa; }
+            tr:hover { background: #e8f4f8; }
+            td:first-child, th:first-child { text-align: left; font-weight: 600; background: #f8f9fa; position: sticky; left: 0; z-index: 10; }
+            .heatmap-cell { font-weight: 500; }
+            .funnel-container { display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }
+            .funnel-bar { height: 40px; display: flex; align-items: center; padding: 0 15px; color: white; font-weight: 600; border-radius: 4px; transition: all 0.3s ease; }
+            .funnel-bar:hover { transform: translateX(5px); }
+            .funnel-meta { margin-left: auto; font-size: 0.9em; opacity: 0.9; }
+            .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
+            .stat-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-left: 4px solid #3498db; }
+            .stat-label { font-size: 0.9em; color: #7f8c8d; margin-bottom: 5px; }
+            .stat-value { font-size: 1.8em; font-weight: 700; color: #2c3e50; }
+            .config-table { max-width: 600px; }
+            .table-wrapper { overflow-x: auto; }
+        """)
+        html_parts.append("</style>")
+        html_parts.append("</head>")
+        html_parts.append("<body>")
+        html_parts.append('<div class="container">')
+        html_parts.append("<h1>留存队列分析报告</h1>")
+        html_parts.append(f'<p class="metadata">生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>')
+
+        html_parts.append("<h2>1. 分析配置</h2>")
+        html_parts.append('<table class="config-table">')
+        html_parts.append("<tr><th>配置项</th><th>值</th></tr>")
+        for k, v in config.items():
+            if isinstance(v, dict):
+                v_str = json.dumps(v, ensure_ascii=False)
+            else:
+                v_str = str(v)
+            html_parts.append(f"<tr><td>{k}</td><td>{v_str}</td></tr>")
+        html_parts.append("</table>")
+
+        html_parts.append("<h2>2. 总体概览</h2>")
+        html_parts.append('<div class="stats-grid">')
+        html_parts.append(f'<div class="stat-card"><div class="stat-label">队列总数</div><div class="stat-value">{summary.get("total_cohorts", 0)}</div></div>')
+        html_parts.append(f'<div class="stat-card"><div class="stat-label">总用户数</div><div class="stat-value">{self._fmt_int(summary.get("total_users", 0))}</div></div>')
+        avg_ret = summary.get("average_retention", {})
+        if avg_ret:
+            sorted_days = sorted(avg_ret.items(), key=lambda x: int(x[0].replace("day_", "")))
+            key_days = [0, 1, 3, 7, 14, 30]
+            for day_key, rate in sorted_days:
+                day_num = int(day_key.replace("day_", ""))
+                if day_num in key_days:
+                    html_parts.append(f'<div class="stat-card"><div class="stat-label">第 {day_num} 天留存</div><div class="stat-value">{self._fmt_pct(rate)}</div></div>')
+        html_parts.append("</div>")
+
+        outlier_stats = summary.get("outlier_stats")
+        if outlier_stats:
+            html_parts.append("<h3>异常值统计</h3>")
+            html_parts.append('<div class="stats-grid">')
+            html_parts.append(f'<div class="stat-card"><div class="stat-label">检测方法</div><div class="stat-value" style="font-size: 1.2em;">{outlier_stats.get("method", "-")}</div></div>')
+            html_parts.append(f'<div class="stat-card"><div class="stat-label">移除用户数</div><div class="stat-value">{outlier_stats.get("removed", 0)}</div></div>')
+            if "cohorts_removed" in outlier_stats:
+                html_parts.append(f'<div class="stat-card"><div class="stat-label">移除队列数</div><div class="stat-value">{outlier_stats.get("cohorts_removed", 0)}</div></div>')
+            html_parts.append("</div>")
+
+        html_parts.append("<h2>3. 留存漏斗</h2>")
+        html_parts.append('<div class="funnel-container">')
+        if result.funnel:
+            colors = ["#2ecc71", "#27ae60", "#3498db", "#2980b9", "#9b59b6", "#8e44ad", "#e67e22", "#d35400"]
+            for i, step in enumerate(result.funnel.steps):
+                color = colors[i % len(colors)]
+                pct = step.conversion_rate * 100
+                html_parts.append(f'<div class="funnel-bar" style="width: {max(pct, 5)}%; background: {color};">')
+                html_parts.append(f"<span>{step.name}</span>")
+                html_parts.append(f'<span class="funnel-meta">{self._fmt_int(step.user_count)} 用户 | {self._fmt_pct(step.conversion_rate)}</span>')
+                html_parts.append("</div>")
+        html_parts.append("</div>")
+
+        html_parts.append("<h2>4. 留存矩阵（人数）</h2>")
+        html_parts.append('<div class="table-wrapper">')
+        html_parts.append("<table>")
+        html_parts.append("<tr><th>分群日期 \\ 天数</th>")
+        for col in counts_df.columns:
+            html_parts.append(f"<th>{col}</th>")
+        html_parts.append("</tr>")
+        for idx, row in counts_df.iterrows():
+            html_parts.append(f"<tr><td>{idx}</td>")
+            for v in row:
+                display_v = str(int(v)) if isinstance(v, (int, float)) and not pd.isna(v) and v != "-" else "-"
+                html_parts.append(f"<td>{display_v}</td>")
+            html_parts.append("</tr>")
+        html_parts.append("</table>")
+        html_parts.append("</div>")
+
+        html_parts.append("<h2>5. 留存矩阵（热力图）</h2>")
+        html_parts.append('<div class="table-wrapper">')
+        html_parts.append("<table>")
+        html_parts.append("<tr><th>分群日期 \\ 天数</th>")
+        for col in rates_df.columns:
+            html_parts.append(f"<th>{col}</th>")
+        html_parts.append("</tr>")
+        for idx, row in rates_df.iterrows():
+            html_parts.append(f"<tr><td>{idx}</td>")
+            for v in row:
+                color = self._get_heatmap_color(v)
+                display_v = self._fmt_pct(v) if pd.notna(v) else "-"
+                html_parts.append(f'<td class="heatmap-cell" style="background: {color};">{display_v}</td>')
+            html_parts.append("</tr>")
+        html_parts.append("</table>")
+        html_parts.append("</div>")
+
+        html_parts.append("<h2>6. 各队列规模</h2>")
+        html_parts.append('<table style="max-width: 400px;">')
+        html_parts.append("<tr><th>分群日期</th><th>用户数</th></tr>")
+        for d in matrix.cohort_dates:
+            size = matrix.cohort_sizes.get(d, 0)
+            html_parts.append(f"<tr><td>{d.strftime('%Y-%m-%d')}</td><td>{self._fmt_int(size)}</td></tr>")
+        html_parts.append("</table>")
+
+        html_parts.append("</div>")
+        html_parts.append("</body>")
+        html_parts.append("</html>")
+
+        return "\n".join(html_parts)
+
+    def save(self, result: CohortAnalysisResult, filename: Optional[str] = None) -> str:
         Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
 
         if not filename:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"retention_counts_{timestamp}.csv"
+            filename = f"cohort_report_{timestamp}.html"
 
         filepath = os.path.join(self.config.output_dir, filename)
-        df = result.matrix.retention_counts.copy()
+        content = self.generate(result)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        return filepath
+
+
+class MatrixExporter:
+    def __init__(self, config: ReportConfig):
+        self.config = config
+
+    def _prepare_df(self, result: CohortAnalysisResult, is_counts: bool) -> pd.DataFrame:
+        if is_counts:
+            df = result.matrix.retention_counts.copy()
+        else:
+            df = result.matrix.retention_rates.copy()
         df.index = [d.strftime("%Y-%m-%d") for d in result.matrix.cohort_dates]
         df.columns = [f"day_{d}" for d in result.matrix.days]
+        df.index.name = "cohort_date"
+        return df
+
+    def export_counts_csv(self, result: CohortAnalysisResult, filename: Optional[str] = None) -> str:
+        Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"retention_counts_{timestamp}.csv"
+        filepath = os.path.join(self.config.output_dir, filename)
+        df = self._prepare_df(result, is_counts=True)
         df.to_csv(filepath, encoding="utf-8")
         return filepath
 
     def export_rates_csv(self, result: CohortAnalysisResult, filename: Optional[str] = None) -> str:
         Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
-
         if not filename:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"retention_rates_{timestamp}.csv"
-
         filepath = os.path.join(self.config.output_dir, filename)
-        df = result.matrix.retention_rates.copy()
-        df.index = [d.strftime("%Y-%m-%d") for d in result.matrix.cohort_dates]
-        df.columns = [f"day_{d}" for d in result.matrix.days]
+        df = self._prepare_df(result, is_counts=False)
         df.to_csv(filepath, encoding="utf-8")
         return filepath
 
+    def export_counts_parquet(self, result: CohortAnalysisResult, filename: Optional[str] = None) -> str:
+        Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"retention_counts_{timestamp}.parquet"
+        filepath = os.path.join(self.config.output_dir, filename)
+        df = self._prepare_df(result, is_counts=True)
+        df.to_parquet(filepath)
+        return filepath
 
-__all__ = ["MarkdownReporter", "JsonReporter", "MatrixExporter"]
+    def export_rates_parquet(self, result: CohortAnalysisResult, filename: Optional[str] = None) -> str:
+        Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"retention_rates_{timestamp}.parquet"
+        filepath = os.path.join(self.config.output_dir, filename)
+        df = self._prepare_df(result, is_counts=False)
+        df.to_parquet(filepath)
+        return filepath
+
+
+__all__ = ["MarkdownReporter", "JsonReporter", "HtmlReporter", "MatrixExporter"]
