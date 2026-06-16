@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cohort-retention-cli"
+version = "0.1.0"
+description = "留存队列分析 CLI - 按用户首单或注册时间分组，统计后续 N 天回流比例与漏斗"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Cohort Team" }
+]
+dependencies = [
+    "click>=8.1.0",
+    "pandas>=1.5.0",
+    "numpy>=1.23.0",
+]
+
+[project.scripts]
+cohort = "cohort_retention.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]

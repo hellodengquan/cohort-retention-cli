@@ -1,0 +1,2 @@
+[console_scripts]
+cohort = cohort_retention.cli:cli
