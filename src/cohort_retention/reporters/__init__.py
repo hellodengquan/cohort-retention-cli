@@ -286,6 +286,56 @@ class HtmlReporter:
         html = re.sub(r"\s+", " ", html)
         return html.strip()
 
+    def _generate_html_head(self, result: CohortAnalysisResult) -> str:
+        seo = self.config.seo
+        parts = []
+        parts.append(f'<meta charset="UTF-8">')
+        parts.append(f'<meta name="viewport" content="width=device-width, initial-scale=1.0">')
+        parts.append(f'<meta name="description" content="{seo.description}">')
+        parts.append(f'<meta name="keywords" content="{",".join(seo.keywords)}">')
+        parts.append(f'<meta name="author" content="{seo.author}">')
+        parts.append(f'<meta name="robots" content="{seo.robots}">')
+        if seo.canonical_url:
+            parts.append(f'<link rel="canonical" href="{seo.canonical_url}">')
+        parts.append(f'<meta property="og:type" content="{seo.og_type}">')
+        parts.append(f'<meta property="og:title" content="{seo.title}">')
+        parts.append(f'<meta property="og:description" content="{seo.description}">')
+        parts.append(f'<meta property="og:locale" content="{seo.language}">')
+        if seo.og_image:
+            parts.append(f'<meta property="og:image" content="{seo.og_image}">')
+        parts.append(f'<title>{seo.title}</title>')
+        return "\n".join(parts)
+
+    def _generate_structured_data(self, result: CohortAnalysisResult) -> str:
+        seo = self.config.seo
+        if not seo.enable_structured_data:
+            return ""
+
+        summary = result.summary or {}
+        sd = {
+            "@context": "https://schema.org",
+            "@type": "Article",
+            "headline": seo.title,
+            "description": seo.description,
+            "author": {"@type": "Organization", "name": seo.author},
+            "inLanguage": seo.language,
+            "datePublished": datetime.now().strftime("%Y-%m-%d"),
+            "dateModified": datetime.now().strftime("%Y-%m-%d"),
+            "keywords": seo.keywords,
+        }
+        total_users = summary.get("total_users", 0)
+        total_cohorts = summary.get("total_cohorts", 0)
+        if total_users or total_cohorts:
+            sd["about"] = {
+                "@type": "Dataset",
+                "name": "留存分析数据",
+                "description": f"包含 {total_cohorts} 个队列，共 {total_users} 个用户的留存分析数据",
+                "variableMeasured": ["用户留存率", "队列规模", "漏斗转化率"],
+            }
+        import json as _json
+        escaped = _json.dumps(sd, ensure_ascii=False).replace("</script>", "<\\/script>")
+        return f'<script type="application/ld+json">{escaped}</script>'
+
     def generate(self, result: CohortAnalysisResult) -> str:
         matrix = result.matrix
         config = result.config or {}
@@ -301,11 +351,10 @@ class HtmlReporter:
 
         html_parts = []
         html_parts.append("<!DOCTYPE html>")
-        html_parts.append('<html lang="zh-CN">')
+        html_parts.append(f'<html lang="{self.config.seo.language}">')
         html_parts.append("<head>")
-        html_parts.append('<meta charset="UTF-8">')
-        html_parts.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">')
-        html_parts.append("<title>留存队列分析报告</title>")
+        html_parts.append(self._generate_html_head(result))
+        html_parts.append(self._generate_structured_data(result))
         html_parts.append("<style>")
         html_parts.append("""
             * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -335,9 +384,10 @@ class HtmlReporter:
         html_parts.append("</style>")
         html_parts.append("</head>")
         html_parts.append("<body>")
-        html_parts.append('<div class="container">')
-        html_parts.append("<h1>留存队列分析报告</h1>")
-        html_parts.append(f'<p class="metadata">生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>')
+        html_parts.append('<div class="container" role="main">')
+        html_parts.append(f"<header><h1>{self.config.seo.title}</h1></header>")
+        html_parts.append(f'<p class="metadata">生成时间: <time datetime="{datetime.now().strftime("%Y-%m-%dT%H:%M:%S")}">{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</time></p>')
+        html_parts.append(f'<meta itemprop="datePublished" content="{datetime.now().strftime("%Y-%m-%d")}">')
 
         html_parts.append("<h2>1. 分析配置</h2>")
         html_parts.append('<table class="config-table">')

@@ -1,5 +1,6 @@
-from typing import Optional, List, Any, Iterator, ContextManager
+from typing import Optional, List, Any, Iterator, ContextManager, Dict
 from contextlib import contextmanager
+import time
 import pandas as pd
 from .base import BaseDataLoader
 from ..config import DataSourceConfig, CohortConfig
@@ -40,6 +41,9 @@ class PostgreSqlDataLoader(BaseDataLoader):
         super().__init__(source_config, cohort_config)
         self._psycopg2, self._isolation_levels = _get_psycopg()
         self._create_engine = _get_sqlalchemy()
+        self._savepoint_counter: int = 0
+        self._transaction_stack: List[Dict[str, Any]] = []
+        self._transaction_stats: Dict[str, Any] = {}
 
     def _build_connection_string(self, for_sqlalchemy: bool = False) -> str:
         cfg = self.source_config
@@ -56,9 +60,19 @@ class PostgreSqlDataLoader(BaseDataLoader):
 
     def _get_connection(self, isolation_level: Optional[str] = None):
         conn_str = self._build_connection_string(for_sqlalchemy=False)
+        cfg = getattr(self.source_config, 'transaction_config', None)
+
         conn = self._psycopg2.connect(conn_str)
         if isolation_level and isolation_level in ISOLATION_LEVELS:
             conn.set_isolation_level(ISOLATION_LEVELS[isolation_level])
+
+        if cfg and cfg.statement_timeout_ms:
+            with conn.cursor() as cur:
+                cur.execute(f"SET statement_timeout = {cfg.statement_timeout_ms}")
+        if cfg and cfg.lock_timeout_ms:
+            with conn.cursor() as cur:
+                cur.execute(f"SET lock_timeout = {cfg.lock_timeout_ms}")
+
         return conn
 
     def _get_table_name(self) -> str:
@@ -67,24 +81,144 @@ class PostgreSqlDataLoader(BaseDataLoader):
             return f"{cfg.schema}.{cfg.table}"
         return cfg.table or "events"
 
+    def _is_deadlock(self, exc: Exception) -> bool:
+        err_str = str(exc).lower()
+        deadlock_markers = ["deadlock", "40p01", "could not obtain lock"]
+        return any(m in err_str for m in deadlock_markers)
+
+    @contextmanager
+    def savepoint(self, conn: Any, name: Optional[str] = None) -> Iterator[str]:
+        self._savepoint_counter += 1
+        sp_name = name or f"sp_{id(conn)}_{self._savepoint_counter}"
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f'SAVEPOINT "{sp_name}"')
+            yield sp_name
+        except Exception as exc:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f'ROLLBACK TO SAVEPOINT "{sp_name}"')
+            except Exception:
+                pass
+            raise
+        else:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f'RELEASE SAVEPOINT "{sp_name}"')
+            except Exception:
+                pass
+
     @contextmanager
     def transaction(
         self,
         isolation_level: str = "read_committed",
         autocommit: bool = False,
+        enable_savepoints: bool = True,
+        retry_on_deadlock: Optional[bool] = None,
+        deadlock_retries: Optional[int] = None,
+        retry_delay_ms: Optional[int] = None,
+        rollback_on_error: bool = True,
+        max_nested: Optional[int] = None,
     ) -> Iterator[Any]:
-        conn = self._get_connection(isolation_level=isolation_level)
-        conn.autocommit = autocommit
-        try:
-            yield conn
-            if not autocommit:
-                conn.commit()
-        except Exception:
-            if not autocommit:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
+        cfg = getattr(self.source_config, 'transaction_config', None)
+        if cfg:
+            if retry_on_deadlock is None:
+                retry_on_deadlock = cfg.retry_on_deadlock
+            if deadlock_retries is None:
+                deadlock_retries = cfg.deadlock_retries
+            if retry_delay_ms is None:
+                retry_delay_ms = cfg.retry_delay_ms
+            if max_nested is None:
+                max_nested = cfg.nested_transaction_limit
+            if enable_savepoints is None:
+                enable_savepoints = cfg.enable_savepoints
+            if rollback_on_error is None:
+                rollback_on_error = cfg.rollback_on_error
+            if isolation_level == "read_committed":
+                isolation_level = cfg.isolation_level
+            if autocommit is False:
+                autocommit = cfg.autocommit
+
+        retry_on_deadlock = retry_on_deadlock if retry_on_deadlock is not None else True
+        deadlock_retries = deadlock_retries if deadlock_retries is not None else 3
+        retry_delay_ms = retry_delay_ms if retry_delay_ms is not None else 100
+        max_nested = max_nested or 5
+
+        if len(self._transaction_stack) >= max_nested:
+            self._transaction_stats.setdefault("nested_limit_hit", 0)
+            self._transaction_stats["nested_limit_hit"] += 1
+            raise RuntimeError(
+                f"超过嵌套事务限制 ({max_nested})，当前嵌套深度: {len(self._transaction_stack)}"
+            )
+
+        attempt = 0
+        conn = None
+        last_exc = None
+
+        while attempt <= deadlock_retries:
+            attempt += 1
+            try:
+                conn = self._get_connection(isolation_level=isolation_level)
+                conn.autocommit = autocommit
+
+                txn_info = {
+                    "isolation": isolation_level,
+                    "start_time": time.time(),
+                    "attempt": attempt,
+                    "savepoints_created": 0,
+                    "savepoints_rolled_back": 0,
+                }
+                self._transaction_stack.append(txn_info)
+
+                try:
+                    yield conn
+                    if not autocommit:
+                        conn.commit()
+                except Exception as exc:
+                    if rollback_on_error and not autocommit:
+                        try:
+                            conn.rollback()
+                            txn_info["rolled_back"] = True
+                        except Exception:
+                            pass
+
+                    if retry_on_deadlock and self._is_deadlock(exc) and attempt <= deadlock_retries:
+                        last_exc = exc
+                        txn_info["deadlock_detected"] = True
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        time.sleep(retry_delay_ms / 1000.0)
+                        continue
+
+                    raise
+                else:
+                    txn_info["committed"] = True
+                    txn_info["duration_ms"] = (time.time() - txn_info["start_time"]) * 1000
+
+                    self._transaction_stats.setdefault("committed_count", 0)
+                    self._transaction_stats["committed_count"] += 1
+                    self._transaction_stats.setdefault("total_duration_ms", 0)
+                    self._transaction_stats["total_duration_ms"] += txn_info["duration_ms"]
+                    break
+                finally:
+                    if self._transaction_stack and self._transaction_stack[-1] is txn_info:
+                        self._transaction_stack.pop()
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        if last_exc is not None and attempt > deadlock_retries:
+            self._transaction_stats.setdefault("deadlock_failed", 0)
+            self._transaction_stats["deadlock_failed"] += 1
+            raise RuntimeError(f"死锁重试{deadlock_retries}次后仍然失败: {last_exc}") from last_exc
+
+    def get_transaction_stats(self) -> Dict[str, Any]:
+        return dict(self._transaction_stats)
 
     def load_events(self) -> pd.DataFrame:
         table = self._get_table_name()

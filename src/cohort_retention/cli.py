@@ -18,6 +18,11 @@ from .config import (
     RollingWindowConfig,
     CompositeEventConfig,
     RollingAlignment,
+    TimeZoneHandling,
+    SEOSettings,
+    PostgresTransactionConfig,
+    ParquetConfig,
+    ParquetCodecMetrics,
 )
 from .loaders import create_loader
 from .analyzer import CohortAnalyzer
@@ -67,6 +72,10 @@ def _build_cohort_config(
     dsl_segment: str,
     dsl_error_recovery: bool,
     dsl_default_numeric: float,
+    dsl_default_string: str,
+    dsl_coalesce_on_error: bool,
+    dsl_strict_mode: bool,
+    dsl_fail_on_critical: bool,
     outlier_enabled: bool,
     outlier_method: str,
     outlier_threshold: float,
@@ -79,12 +88,17 @@ def _build_cohort_config(
     outlier_remove_users: bool,
     outlier_remove_cohorts: bool,
     outlier_target_col: str,
+    outlier_auto_min_rows: int,
+    outlier_auto_max_rows: int,
     rolling_enabled: bool,
     rolling_window: int,
     rolling_step: int,
     rolling_min_periods: int,
     rolling_alignment: str,
     rolling_include_partial: bool,
+    rolling_timezone_handling: str,
+    rolling_target_timezone: str,
+    rolling_handle_dst: bool,
 ) -> CohortConfig:
     dsl_config = CohortDSLConfig(
         cohort_expression=dsl_cohort if dsl_cohort else None,
@@ -92,6 +106,10 @@ def _build_cohort_config(
         segment_expression=dsl_segment if dsl_segment else None,
         error_recovery=dsl_error_recovery,
         default_numeric=dsl_default_numeric,
+        default_string=dsl_default_string,
+        coalesce_on_error=dsl_coalesce_on_error,
+        strict_mode=dsl_strict_mode,
+        fail_on_critical=dsl_fail_on_critical,
     )
 
     outlier_config = OutlierConfig(
@@ -107,6 +125,8 @@ def _build_cohort_config(
         remove_users=outlier_remove_users,
         remove_cohorts=outlier_remove_cohorts,
         target_column=outlier_target_col if outlier_target_col else None,
+        auto_min_rows=outlier_auto_min_rows,
+        auto_max_rows=outlier_auto_max_rows,
     )
 
     rolling_config = RollingWindowConfig(
@@ -116,6 +136,9 @@ def _build_cohort_config(
         min_periods=rolling_min_periods,
         alignment=RollingAlignment(rolling_alignment),
         include_partial=rolling_include_partial,
+        timezone_handling=TimeZoneHandling(rolling_timezone_handling),
+        target_timezone=rolling_target_timezone if rolling_target_timezone else None,
+        handle_dst=rolling_handle_dst,
     )
 
     composite_configs = _parse_composite_events(composite_events) if composite_events else []
@@ -148,7 +171,25 @@ def _build_source_config(
     password: str,
     database: str,
     schema: str,
+    pg_isolation_level: str,
+    pg_autocommit: bool,
+    pg_enable_savepoints: bool,
+    pg_nested_transaction_limit: int,
+    pg_retry_on_deadlock: bool,
+    pg_deadlock_retries: int,
+    pg_statement_timeout_ms: int,
+    pg_lock_timeout_ms: int,
 ) -> DataSourceConfig:
+    transaction_config = PostgresTransactionConfig(
+        isolation_level=pg_isolation_level,
+        autocommit=pg_autocommit,
+        enable_savepoints=pg_enable_savepoints,
+        nested_transaction_limit=pg_nested_transaction_limit,
+        retry_on_deadlock=pg_retry_on_deadlock,
+        deadlock_retries=pg_deadlock_retries,
+        statement_timeout_ms=pg_statement_timeout_ms if pg_statement_timeout_ms > 0 else None,
+        lock_timeout_ms=pg_lock_timeout_ms if pg_lock_timeout_ms > 0 else None,
+    )
     return DataSourceConfig(
         source_type=source_type,
         path=path if path else "",
@@ -160,6 +201,7 @@ def _build_source_config(
         password=password if password else None,
         database=database if database else None,
         schema=schema if schema else None,
+        transaction_config=transaction_config,
     )
 
 
@@ -173,12 +215,41 @@ def _build_report_config(
     ssr_minify: bool = False,
     parquet_spark_compatible: bool = True,
     parquet_compression: str = "snappy",
+    parquet_benchmark_codecs: bool = False,
+    parquet_coerce_timestamps: str = "us",
+    seo_title: str = "留存队列分析报告",
+    seo_description: str = "基于 cohort-retention-cli 生成的用户留存分析报告，包含留存矩阵、漏斗分析、滚动留存等关键指标",
+    seo_keywords: str = "",
+    seo_author: str = "cohort-retention-cli",
+    seo_language: str = "zh-CN",
+    seo_og_type: str = "article",
+    seo_robots: str = "noindex,nofollow",
+    seo_enable_structured_data: bool = True,
+    detect_conflicts: bool = True,
+    enable_conflict_suggestions: bool = True,
 ) -> ReportConfig:
-    from .config import ParquetConfig
+    kw_list = [k.strip() for k in seo_keywords.split(",") if k.strip()]
+    if not kw_list:
+        kw_list = ["留存分析", "用户留存", "cohort analysis", "用户行为分析", "数据分析"]
+
+    seo = SEOSettings(
+        title=seo_title,
+        description=seo_description,
+        keywords=kw_list,
+        author=seo_author,
+        language=seo_language,
+        og_type=seo_og_type,
+        robots=seo_robots,
+        enable_structured_data=seo_enable_structured_data,
+    )
+
+    coerce_val = None if parquet_coerce_timestamps in ("none", "None", "") else parquet_coerce_timestamps
 
     parquet_cfg = ParquetConfig(
         spark_compatible=parquet_spark_compatible,
         compression=parquet_compression,
+        benchmark_codecs=parquet_benchmark_codecs,
+        coerce_timestamps=coerce_val,
     )
 
     return ReportConfig(
@@ -190,6 +261,9 @@ def _build_report_config(
         ssr_embed_data=ssr_embed_data,
         ssr_minify=ssr_minify,
         parquet=parquet_cfg,
+        seo=seo,
+        detect_conflicts=detect_conflicts,
+        enable_conflict_suggestions=enable_conflict_suggestions,
     )
 
 
@@ -211,6 +285,14 @@ def cli():
 @click.option("--password", default=None, help="PostgreSQL 密码")
 @click.option("--database", default=None, help="PostgreSQL 数据库名")
 @click.option("--schema", default=None, help="PostgreSQL schema")
+@click.option("--pg-isolation-level", type=click.Choice(["read_uncommitted", "read_committed", "repeatable_read", "serializable"]), default="read_committed", help="PostgreSQL 隔离级别")
+@click.option("--pg-autocommit/--no-pg-autocommit", default=False, help="PostgreSQL 自动提交")
+@click.option("--pg-enable-savepoints/--no-pg-enable-savepoints", default=True, help="PostgreSQL 启用 savepoint")
+@click.option("--pg-nested-transaction-limit", default=5, type=int, help="嵌套事务层数限制")
+@click.option("--pg-retry-on-deadlock/--no-pg-retry-on-deadlock", default=True, help="死锁时自动重试")
+@click.option("--pg-deadlock-retries", default=3, type=int, help="死锁最大重试次数")
+@click.option("--pg-statement-timeout-ms", default=0, type=int, help="语句超时(ms)，0表示不限制")
+@click.option("--pg-lock-timeout-ms", default=0, type=int, help="锁等待超时(ms)，0表示不限制")
 @click.option("--cohort-key", type=click.Choice(["first_order", "register", "custom"]), default="first_order", help="分群依据")
 @click.option("--granularity", type=click.Choice(["day", "week", "month", "quarter"]), default="day", help="时间粒度")
 @click.option("--retention-days", default=30, type=int, help="统计留存的天数")
@@ -226,8 +308,12 @@ def cli():
 @click.option("--dsl-segment", default=None, help="DSL 分段表达式")
 @click.option("--dsl-error-recovery/--no-dsl-error-recovery", default=True, help="DSL 错误恢复")
 @click.option("--dsl-default-numeric", default=0.0, type=float, help="DSL 数值默认值")
+@click.option("--dsl-default-string", default="", help="DSL 字符串默认值")
+@click.option("--dsl-coalesce-on-error/--no-dsl-coalesce-on-error", default=True, help="DSL 错误时 coalesce 为默认值")
+@click.option("--dsl-strict-mode/--no-dsl-strict-mode", default=False, help="DSL 严格模式（不做错误恢复）")
+@click.option("--dsl-fail-on-critical/--no-dsl-fail-on-critical", default=True, help="关键错误时终止")
 @click.option("--outlier-enabled/--outlier-disabled", default=False, help="是否启用异常值剔除")
-@click.option("--outlier-method", type=click.Choice(["iqr", "zscore", "percentile", "mad", "isolation_forest", "dbscan"]), default="iqr", help="异常值检测方法")
+@click.option("--outlier-method", type=click.Choice(["iqr", "zscore", "percentile", "mad", "isolation_forest", "dbscan", "auto"]), default="iqr", help="异常值检测方法")
 @click.option("--outlier-threshold", default=1.5, type=float, help="异常值检测阈值")
 @click.option("--outlier-percentile-low", default=1.0, type=float, help="百分位数法下限")
 @click.option("--outlier-percentile-high", default=99.0, type=float, help="百分位数法上限")
@@ -238,18 +324,35 @@ def cli():
 @click.option("--outlier-remove-users/--no-outlier-remove-users", default=False, help="是否移除异常用户")
 @click.option("--outlier-remove-cohorts/--no-outlier-remove-cohorts", default=True, help="是否移除异常队列")
 @click.option("--outlier-target-col", default=None, help="异常值检测目标列")
+@click.option("--outlier-auto-min-rows", default=1000, type=int, help="AUTO 方法最小样本量")
+@click.option("--outlier-auto-max-rows", default=100000, type=int, help="AUTO 方法最大样本量阈值")
 @click.option("--rolling-enabled/--rolling-disabled", default=False, help="是否启用滚动留存窗")
 @click.option("--rolling-window", default=7, type=int, help="滚动窗口大小（天）")
 @click.option("--rolling-step", default=1, type=int, help="滚动步长（天）")
 @click.option("--rolling-min-periods", default=1, type=int, help="滚动最小观测期")
 @click.option("--rolling-alignment", type=click.Choice(["left", "center", "right"]), default="left", help="滚动窗口对齐方式")
 @click.option("--rolling-include-partial/--no-rolling-include-partial", default=False, help="是否包含不完整窗口")
+@click.option("--rolling-timezone-handling", type=click.Choice(["naive", "utc", "local", "preserve"]), default="naive", help="时区处理模式")
+@click.option("--rolling-target-timezone", default=None, help="目标时区（如 Asia/Shanghai）")
+@click.option("--rolling-handle-dst/--no-rolling-handle-dst", default=True, help="处理夏令时偏移")
 @click.option("--ssr-enabled/--no-ssr-enabled", default=True, help="HTML 报告 SSR 启用")
 @click.option("--ssr-render-charts/--no-ssr-render-charts", default=True, help="SSR 渲染图表")
 @click.option("--ssr-embed-data/--no-ssr-embed-data", default=True, help="SSR 嵌入数据")
 @click.option("--ssr-minify/--no-ssr-minify", default=False, help="SSR 压缩 HTML")
 @click.option("--parquet-spark-compatible/--no-parquet-spark-compatible", default=True, help="Parquet Spark 兼容")
 @click.option("--parquet-compression", type=click.Choice(["snappy", "gzip", "brotli", "lz4", "zstd", "none"]), default="snappy", help="Parquet 压缩格式")
+@click.option("--parquet-benchmark-codecs/--no-parquet-benchmark-codecs", default=False, help="运行 Parquet 压缩基准测试")
+@click.option("--parquet-coerce-timestamps", type=click.Choice(["us", "ms", "none"]), default="us", help="时间戳强制精度")
+@click.option("--seo-title", default="留存队列分析报告", help="HTML 报告 SEO 标题")
+@click.option("--seo-description", default="基于 cohort-retention-cli 生成的用户留存分析报告，包含留存矩阵、漏斗分析、滚动留存等关键指标", help="SEO 描述")
+@click.option("--seo-keywords", default="", help="SEO 关键词(逗号分隔）")
+@click.option("--seo-author", default="cohort-retention-cli", help="SEO 作者")
+@click.option("--seo-language", default="zh-CN", help="页面语言")
+@click.option("--seo-og-type", default="article", help="Open Graph 类型")
+@click.option("--seo-robots", default="noindex,nofollow", help="robots meta")
+@click.option("--seo-enable-structured-data/--no-seo-enable-structured-data", default=True, help="嵌入 JSON-LD 结构化数据")
+@click.option("--detect-conflicts/--no-detect-conflicts", default=True, help="检测参数冲突")
+@click.option("--enable-conflict-suggestions/--no-enable-conflict-suggestions", default=True, help="生成冲突解决建议")
 @click.option("--output-dir", default="./reports", help="报告输出目录")
 @click.option("--format", "formats", type=click.Choice(["markdown", "json", "html"]), multiple=True, default=["markdown", "json"], help="报告格式")
 @click.option("--matrix-format", type=click.Choice(["csv", "parquet"]), default="csv", help="矩阵导出格式")
@@ -265,6 +368,14 @@ def analyze(
     password,
     database,
     schema,
+    pg_isolation_level,
+    pg_autocommit,
+    pg_enable_savepoints,
+    pg_nested_transaction_limit,
+    pg_retry_on_deadlock,
+    pg_deadlock_retries,
+    pg_statement_timeout_ms,
+    pg_lock_timeout_ms,
     cohort_key,
     granularity,
     retention_days,
@@ -280,6 +391,10 @@ def analyze(
     dsl_segment,
     dsl_error_recovery,
     dsl_default_numeric,
+    dsl_default_string,
+    dsl_coalesce_on_error,
+    dsl_strict_mode,
+    dsl_fail_on_critical,
     outlier_enabled,
     outlier_method,
     outlier_threshold,
@@ -292,24 +407,41 @@ def analyze(
     outlier_remove_users,
     outlier_remove_cohorts,
     outlier_target_col,
+    outlier_auto_min_rows,
+    outlier_auto_max_rows,
     rolling_enabled,
     rolling_window,
     rolling_step,
     rolling_min_periods,
     rolling_alignment,
     rolling_include_partial,
+    rolling_timezone_handling,
+    rolling_target_timezone,
+    rolling_handle_dst,
     ssr_enabled,
     ssr_render_charts,
     ssr_embed_data,
     ssr_minify,
     parquet_spark_compatible,
     parquet_compression,
+    parquet_benchmark_codecs,
+    parquet_coerce_timestamps,
+    seo_title,
+    seo_description,
+    seo_keywords,
+    seo_author,
+    seo_language,
+    seo_og_type,
+    seo_robots,
+    seo_enable_structured_data,
+    detect_conflicts,
+    enable_conflict_suggestions,
     output_dir,
     formats,
     matrix_format,
     export_matrix,
 ):
-    """运行留存队列分析并生成报告"""
+    """运行留存队列分析并生成报告（30+ 完整参数）"""
 
     try:
         cohort_config = _build_cohort_config(
@@ -328,6 +460,10 @@ def analyze(
             dsl_segment=dsl_segment,
             dsl_error_recovery=dsl_error_recovery,
             dsl_default_numeric=dsl_default_numeric,
+            dsl_default_string=dsl_default_string,
+            dsl_coalesce_on_error=dsl_coalesce_on_error,
+            dsl_strict_mode=dsl_strict_mode,
+            dsl_fail_on_critical=dsl_fail_on_critical,
             outlier_enabled=outlier_enabled,
             outlier_method=outlier_method,
             outlier_threshold=outlier_threshold,
@@ -340,12 +476,17 @@ def analyze(
             outlier_remove_users=outlier_remove_users,
             outlier_remove_cohorts=outlier_remove_cohorts,
             outlier_target_col=outlier_target_col,
+            outlier_auto_min_rows=outlier_auto_min_rows,
+            outlier_auto_max_rows=outlier_auto_max_rows,
             rolling_enabled=rolling_enabled,
             rolling_window=rolling_window,
             rolling_step=rolling_step,
             rolling_min_periods=rolling_min_periods,
             rolling_alignment=rolling_alignment,
             rolling_include_partial=rolling_include_partial,
+            rolling_timezone_handling=rolling_timezone_handling,
+            rolling_target_timezone=rolling_target_timezone,
+            rolling_handle_dst=rolling_handle_dst,
         )
 
         source_config = _build_source_config(
@@ -359,6 +500,14 @@ def analyze(
             password=password,
             database=database,
             schema=schema,
+            pg_isolation_level=pg_isolation_level,
+            pg_autocommit=pg_autocommit,
+            pg_enable_savepoints=pg_enable_savepoints,
+            pg_nested_transaction_limit=pg_nested_transaction_limit,
+            pg_retry_on_deadlock=pg_retry_on_deadlock,
+            pg_deadlock_retries=pg_deadlock_retries,
+            pg_statement_timeout_ms=pg_statement_timeout_ms,
+            pg_lock_timeout_ms=pg_lock_timeout_ms,
         )
 
         report_config = _build_report_config(
@@ -371,6 +520,18 @@ def analyze(
             ssr_minify=ssr_minify,
             parquet_spark_compatible=parquet_spark_compatible,
             parquet_compression=parquet_compression,
+            parquet_benchmark_codecs=parquet_benchmark_codecs,
+            parquet_coerce_timestamps=parquet_coerce_timestamps,
+            seo_title=seo_title,
+            seo_description=seo_description,
+            seo_keywords=seo_keywords,
+            seo_author=seo_author,
+            seo_language=seo_language,
+            seo_og_type=seo_og_type,
+            seo_robots=seo_robots,
+            seo_enable_structured_data=seo_enable_structured_data,
+            detect_conflicts=detect_conflicts,
+            enable_conflict_suggestions=enable_conflict_suggestions,
         )
 
         errors = source_config.validate() + cohort_config.validate() + report_config.validate()
@@ -393,7 +554,63 @@ def analyze(
 
         outlier_stats = result.summary.get("outlier_stats")
         if outlier_stats:
-            click.echo(f"  - 异常移除: {outlier_stats.get('removed', 0)} 用户, {outlier_stats.get('cohorts_removed', 0)} 队列")
+            method_info = outlier_stats.get('method', '-')
+            auto_info = ""
+            if outlier_stats.get('method_resolved_from_auto') and outlier_stats.get('auto_reason'):
+                auto_info = f" [AUTO: {outlier_stats['auto_reason']}]"
+            click.echo(f"  - 异常移除: {outlier_stats.get('removed', 0)} 用户, {outlier_stats.get('cohorts_removed', 0)} 队列, 方法={method_info}{auto_info}")
+
+        timezone_info = result.summary.get("timezone_info")
+        if timezone_info:
+            click.echo(f"  - 时区处理: {timezone_info}")
+
+        analysis_warnings = result.summary.get("analysis_warnings")
+        if analysis_warnings:
+            click.echo("")
+            click.echo("⚠️  分析警告:")
+            for w in analysis_warnings[:5]:
+                click.echo(f"  - {w}")
+            if len(analysis_warnings) > 5:
+                click.echo(f"  ... 还有 {len(analysis_warnings) - 5} 条警告")
+
+        codec_metrics = None
+        if report_config.parquet.benchmark_codecs:
+            click.echo("")
+            click.echo("运行 Parquet 压缩算法基准测试...")
+            try:
+                from .loaders.parquet_loader import ParquetDataLoader
+                events_df = loader.load_events()
+                codec_metrics = None
+                if isinstance(loader, ParquetDataLoader):
+                    codec_metrics = loader.benchmark_codecs(
+                        events_df,
+                        spark_compatible=report_config.parquet.spark_compatible,
+                    )
+                else:
+                    tmp_source = DataSourceConfig(
+                        source_type="parquet",
+                        path="/tmp/_cohort_codec_bench.parquet",
+                    )
+                    bench_loader = ParquetDataLoader(tmp_source, cohort_config, report_config.parquet)
+                    codec_metrics = bench_loader.benchmark_codecs(
+                        events_df,
+                        spark_compatible=report_config.parquet.spark_compatible,
+                    )
+                if codec_metrics:
+                    click.echo("")
+                    click.echo("📊 Parquet 压缩基准测试:")
+                    click.echo(f"  {'压缩算法':<12} {'原始KB':>10} {'压缩后KB':>10} {'压缩比':>8} {'写入ms':>10} {'读取ms':>10} {'备注':>10}")
+                    for m in codec_metrics:
+                        orig_kb = m.original_bytes / 1024
+                        comp_kb = m.compressed_bytes / 1024
+                        note = m.note or ("✓ Spark" if m.spark_compatible else "")
+                        click.echo(
+                            f"  {m.compression:<12} {orig_kb:>10.1f} {comp_kb:>10.1f} "
+                            f"{m.compression_ratio:>7.2f}x {m.write_time_ms:>10.1f} "
+                            f"{m.read_time_ms:>10.1f} {note:>10}"
+                        )
+            except Exception as e:
+                click.echo(f"  ⚠️  基准测试失败: {e}")
 
         generated_files = []
 

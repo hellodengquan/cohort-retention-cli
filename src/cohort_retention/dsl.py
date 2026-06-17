@@ -3,13 +3,37 @@ import ast
 import operator
 from typing import Any, Dict, Optional, Callable, List, Tuple
 from datetime import datetime, timedelta
+from dataclasses import dataclass, field
 
 import pandas as pd
 import numpy as np
 
+from .config import DSLErrorCode
+
 
 class DSLError(Exception):
-    pass
+    def __init__(
+        self,
+        message: str,
+        code: DSLErrorCode = DSLErrorCode.UNKNOWN,
+        recoverable: bool = True,
+        suggestion: Optional[str] = None,
+    ):
+        super().__init__(f"[{code.value}] {message}" + (f" (建议: {suggestion})" if suggestion else ""))
+        self.code = code
+        self.recoverable = recoverable
+        self.suggestion = suggestion
+        self.message = message
+
+
+@dataclass
+class DSLErrorRecord:
+    code: DSLErrorCode
+    message: str
+    recoverable: bool = True
+    suggestion: Optional[str] = None
+    context: Optional[str] = None
+    timestamp: datetime = field(default_factory=datetime.now)
 
 
 class DSLErrorRecovery:
@@ -20,28 +44,104 @@ class DSLErrorRecovery:
         default_numeric: float = 0.0,
         default_string: str = "",
         default_datetime: Optional[str] = None,
+        fail_on_critical: bool = True,
+        error_code_enabled: bool = True,
+        retry_on_recoverable: bool = False,
+        retry_max_attempts: int = 1,
     ):
         self.enabled = enabled
         self.coalesce_on_error = coalesce_on_error
         self.default_numeric = default_numeric
         self.default_string = default_string
         self.default_datetime = default_datetime
+        self.fail_on_critical = fail_on_critical
+        self.error_code_enabled = error_code_enabled
+        self.retry_on_recoverable = retry_on_recoverable
+        self.retry_max_attempts = retry_max_attempts
         self.warnings: List[str] = []
+        self.error_log: List[DSLErrorRecord] = []
+
+    def _classify_error(self, error: Exception) -> Tuple[DSLErrorCode, bool]:
+        if isinstance(error, DSLError):
+            return error.code, error.recoverable
+
+        err_str = str(error).lower()
+
+        if any(k in err_str for k in ["column", "not found", "keyerror", "does not exist"]):
+            return DSLErrorCode.COLUMN_NOT_FOUND, True
+        if any(k in err_str for k in ["type", "dtype", "cannot convert", "valueerror.*convert"]):
+            return DSLErrorCode.TYPE_MISMATCH, True
+        if any(k in err_str for k in ["division by zero", "zero division"]):
+            return DSLErrorCode.DIVISION_BY_ZERO, True
+        if any(k in err_str for k in ["nan", "null", "none", "nat"]):
+            return DSLErrorCode.NULL_VALUE, True
+        if any(k in err_str for k in ["argument", "missing", "required", "positional"]):
+            return DSLErrorCode.ARGUMENT_MISSING, True
+        if any(k in err_str for k in ["syntax", "parse", "unexpected", "invalid syntax"]):
+            return DSLErrorCode.PARSE_ERROR, False
+
+        if any(k in err_str for k in ["function", "call", "not callable"]):
+            return DSLErrorCode.FUNCTION_ERROR, True
+
+        return DSLErrorCode.UNKNOWN, True
 
     def recover(self, error: Exception, dtype_hint: Optional[str] = None) -> Any:
-        self.warnings.append(str(error))
+        code, recoverable = self._classify_error(error)
+
+        suggestion = self._suggest_fix(code, error)
+
+        record = DSLErrorRecord(
+            code=code,
+            message=str(error),
+            recoverable=recoverable,
+            suggestion=suggestion,
+            context=dtype_hint,
+        )
+        self.error_log.append(record)
+
+        warning_msg = f"[{code.value}] " if self.error_code_enabled else ""
+        warning_msg += str(error)
+        if suggestion:
+            warning_msg += f" | {suggestion}"
+        self.warnings.append(warning_msg)
+
         if not self.enabled:
-            raise
+            raise DSLError(str(error), code=code, recoverable=recoverable, suggestion=suggestion)
+
+        if not recoverable and self.fail_on_critical:
+            raise DSLError(str(error), code=code, recoverable=False, suggestion=suggestion)
+
         if self.coalesce_on_error:
-            if dtype_hint == "numeric":
-                return self.default_numeric
-            elif dtype_hint == "string":
-                return self.default_string
-            elif dtype_hint == "datetime":
-                return pd.NaT if self.default_datetime is None else pd.to_datetime(self.default_datetime)
-            else:
-                return self._infer_default(error)
-        raise
+            return self._get_default_value(dtype_hint, error)
+
+        raise DSLError(str(error), code=code, recoverable=recoverable, suggestion=suggestion)
+
+    def _suggest_fix(self, code: DSLErrorCode, error: Exception) -> Optional[str]:
+        if code == DSLErrorCode.COLUMN_NOT_FOUND:
+            return "检查列名拼写或使用 coalesce(col_name, 默认值) 提供备选"
+        if code == DSLErrorCode.TYPE_MISMATCH:
+            return "使用 cast 函数转换类型: cast(列名, 'numeric')"
+        if code == DSLErrorCode.DIVISION_BY_ZERO:
+            return "使用 nullif(denominator, 0) 或 coalesce 避免除零"
+        if code == DSLErrorCode.NULL_VALUE:
+            return "使用 coalesce(col, 默认值) 处理空值"
+        if code == DSLErrorCode.PARSE_ERROR:
+            return "检查表达式语法，确认括号和操作符匹配"
+        if code == DSLErrorCode.FUNCTION_ERROR:
+            return "检查函数名和参数个数是否正确"
+        if code == DSLErrorCode.ARGUMENT_MISSING:
+            return "确认函数调用已提供所有必需参数"
+        return None
+
+    def _get_default_value(self, dtype_hint: Optional[str], error: Exception) -> Any:
+        if dtype_hint == "numeric":
+            return self.default_numeric
+        elif dtype_hint == "string":
+            return self.default_string
+        elif dtype_hint == "datetime":
+            return pd.NaT if self.default_datetime is None else pd.to_datetime(self.default_datetime)
+        else:
+            return self._infer_default(error)
 
     def _infer_default(self, error: Exception) -> Any:
         error_str = str(error).lower()
@@ -315,7 +415,12 @@ class DSLParser:
                     return context[node.id]
                 if df is not None and node.id in df.columns:
                     return df[node.id]
-                raise DSLError(f"未找到变量或列: {node.id}")
+                raise DSLError(
+                    f"未找到变量或列: {node.id}",
+                    code=DSLErrorCode.COLUMN_NOT_FOUND,
+                    recoverable=True,
+                    suggestion=f"检查列名拼写或使用 coalesce({node.id}, 默认值)",
+                )
 
             elif isinstance(node, ast.Attribute):
                 base = cls._parse_node(node.value, context, df, error_recovery)
@@ -335,7 +440,11 @@ class DSLParser:
                             pass
                 if hasattr(base, attr):
                     return getattr(base, attr)
-                raise DSLError(f"对象没有属性: {attr}")
+                raise DSLError(
+                    f"对象没有属性: {attr}",
+                    code=DSLErrorCode.COLUMN_NOT_FOUND,
+                    recoverable=True,
+                )
 
             elif isinstance(node, ast.BinOp):
                 op_type = type(node.op)
@@ -349,14 +458,22 @@ class DSLParser:
                             dtype = cls._infer_dtype([left, right])
                             return error_recovery.recover(e, dtype)
                         raise
-                raise DSLError(f"不支持的二元运算符: {op_type.__name__}")
+                raise DSLError(
+                    f"不支持的二元运算符: {op_type.__name__}",
+                    code=DSLErrorCode.FUNCTION_ERROR,
+                    recoverable=False,
+                )
 
             elif isinstance(node, ast.UnaryOp):
                 op_type = type(node.op)
                 if op_type in cls._UNARY_OPS:
                     operand = cls._parse_node(node.operand, context, df, error_recovery)
                     return cls._UNARY_OPS[op_type](operand)
-                raise DSLError(f"不支持的一元运算符: {op_type.__name__}")
+                raise DSLError(
+                    f"不支持的一元运算符: {op_type.__name__}",
+                    code=DSLErrorCode.FUNCTION_ERROR,
+                    recoverable=False,
+                )
 
             elif isinstance(node, ast.BoolOp):
                 op_type = type(node.op)
@@ -372,7 +489,11 @@ class DSLParser:
                         val = cls._parse_node(value, context, df, error_recovery)
                         result = val if result is None else result | val if isinstance(result, (pd.Series, np.ndarray)) else result or val
                     return result
-                raise DSLError(f"不支持的布尔运算符: {op_type.__name__}")
+                raise DSLError(
+                    f"不支持的布尔运算符: {op_type.__name__}",
+                    code=DSLErrorCode.FUNCTION_ERROR,
+                    recoverable=False,
+                )
 
             elif isinstance(node, ast.Compare):
                 left = cls._parse_node(node.left, context, df, error_recovery)
@@ -383,7 +504,11 @@ class DSLParser:
                         result = cls._BINARY_OPS[op_type](left, right)
                         left = result
                     else:
-                        raise DSLError(f"不支持的比较运算符: {op_type.__name__}")
+                        raise DSLError(
+                            f"不支持的比较运算符: {op_type.__name__}",
+                            code=DSLErrorCode.FUNCTION_ERROR,
+                            recoverable=False,
+                        )
                 return left
 
             elif isinstance(node, ast.Call):
@@ -397,14 +522,23 @@ class DSLParser:
                             if "error_recovery" not in kwargs:
                                 kwargs["error_recovery"] = error_recovery
                         return func(*args, **kwargs)
-                    raise DSLError(f"不支持的函数: {func_name}")
+                    raise DSLError(
+                        f"不支持的函数: {func_name}",
+                        code=DSLErrorCode.FUNCTION_ERROR,
+                        recoverable=True,
+                        suggestion=f"检查函数名是否正确，可用函数: {', '.join(sorted(cls._FUNCTIONS.keys()))}",
+                    )
                 else:
                     func_obj = cls._parse_node(node.func, context, df, error_recovery)
                     if callable(func_obj):
                         args = [cls._parse_node(arg, context, df, error_recovery) for arg in node.args]
                         kwargs = {kw.arg: cls._parse_node(kw.value, context, df, error_recovery) for kw in node.keywords}
                         return func_obj(*args, **kwargs)
-                    raise DSLError(f"不支持的函数调用")
+                    raise DSLError(
+                        f"不支持的函数调用",
+                        code=DSLErrorCode.FUNCTION_ERROR,
+                        recoverable=True,
+                    )
 
             elif isinstance(node, ast.Subscript):
                 base = cls._parse_node(node.value, context, df, error_recovery)
@@ -452,7 +586,11 @@ class DSLParser:
                     for key, value in zip(node.keys, node.values)
                 }
 
-            raise DSLError(f"不支持的语法节点: {type(node).__name__}")
+            raise DSLError(
+                f"不支持的语法节点: {type(node).__name__}",
+                code=DSLErrorCode.PARSE_ERROR,
+                recoverable=False,
+            )
         except Exception as e:
             if error_recovery and error_recovery.enabled:
                 return error_recovery.recover(e)
@@ -473,13 +611,22 @@ class DSLParser:
             tree = ast.parse(expression, mode="eval")
             return cls._parse_node(tree, context, df, error_recovery)
         except SyntaxError as e:
-            raise DSLError(f"表达式语法错误: {e}")
+            raise DSLError(
+                f"表达式语法错误: {e}",
+                code=DSLErrorCode.PARSE_ERROR,
+                recoverable=False,
+                suggestion="检查括号、操作符、引号是否匹配",
+            )
         except DSLError:
             raise
         except Exception as e:
             if error_recovery and error_recovery.enabled:
                 return error_recovery.recover(e)
-            raise DSLError(f"表达式计算失败: {e}")
+            raise DSLError(
+                f"表达式计算失败: {e}",
+                code=DSLErrorCode.FUNCTION_ERROR,
+                recoverable=True,
+            )
 
 
 class CohortDSLEngine:

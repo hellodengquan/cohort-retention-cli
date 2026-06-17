@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from datetime import date
 from typing import Optional, Dict, Any, List, Tuple
+import warnings
 
 from .config import (
     CohortConfig,
@@ -10,6 +11,9 @@ from .config import (
     EventType,
     OutlierMethod,
     RetentionType,
+    RollingAlignment,
+    TimeZoneHandling,
+    CompositeEventConfig,
 )
 from .models import RetentionMatrix, FunnelResult, FunnelStep, CohortAnalysisResult
 from .loaders import BaseDataLoader
@@ -19,6 +23,8 @@ from .dsl import CohortDSLEngine
 class OutlierRemover:
     def __init__(self, config: "OutlierConfig"):
         self.config = config
+        self._resolved_method: Optional[OutlierMethod] = None
+        self._auto_reason: Optional[str] = None
 
     def _detect_iqr(self, values: np.ndarray) -> np.ndarray:
         q1, q3 = np.percentile(values, [25, 75])
@@ -79,6 +85,51 @@ class OutlierRemover:
         labels = dbscan.fit_predict(X)
         return labels == -1
 
+    def _auto_select_method(self, values: np.ndarray) -> OutlierMethod:
+        n = len(values)
+        valid_vals = values[~np.isnan(values)]
+        if len(valid_vals) < 2:
+            return OutlierMethod.IQR
+
+        skew = float(pd.Series(valid_vals).skew()) if len(valid_vals) >= 3 else 0
+        kurt = float(pd.Series(valid_vals).kurtosis()) if len(valid_vals) >= 4 else 0
+        mean = float(np.mean(valid_vals))
+        std = float(np.std(valid_vals))
+        cv = std / abs(mean) if mean != 0 else float('inf')
+        uniq_ratio = len(np.unique(valid_vals)) / len(valid_vals)
+
+        self._auto_reason_parts = []
+
+        if n < self.config.auto_min_rows:
+            method = OutlierMethod.IQR
+            self._auto_reason_parts.append(f"样本量小({n}<{self.config.auto_min_rows})→IQR")
+        elif n > self.config.auto_max_rows:
+            method = OutlierMethod.PERCENTILE
+            self._auto_reason_parts.append(f"样本量大({n}>{self.config.auto_max_rows})→Percentile(性能优先)")
+        elif abs(skew) > 2 or kurt > 7:
+            method = OutlierMethod.MAD
+            self._auto_reason_parts.append(f"分布偏斜(skew={skew:.2f},kurt={kurt:.2f})→MAD(稳健)")
+        elif cv > 1.5 or uniq_ratio < 0.1:
+            method = OutlierMethod.PERCENTILE
+            self._auto_reason_parts.append(f"离散度高(CV={cv:.2f})→Percentile")
+        elif abs(skew) < 0.5 and abs(kurt) < 1:
+            method = OutlierMethod.ZSCORE
+            self._auto_reason_parts.append(f"近似正态(skew={skew:.2f})→Z-score")
+        else:
+            method = OutlierMethod.IQR
+            self._auto_reason_parts.append(f"默认选择→IQR(通用)")
+
+        try:
+            from sklearn.ensemble import IsolationForest
+            if self.config.auto_min_rows <= n <= self.config.auto_max_rows and n >= 500:
+                method = OutlierMethod.ISOLATION_FOREST
+                self._auto_reason_parts.append(f"中等样本+sklearn可用→IsolationForest")
+        except ImportError:
+            pass
+
+        self._auto_reason = "; ".join(self._auto_reason_parts)
+        return method
+
     def remove_outliers(
         self,
         df: pd.DataFrame,
@@ -92,42 +143,61 @@ class OutlierRemover:
             raise ValueError("异常值检测需要指定 value_col 或 target_column")
 
         values = df[target_col].values
+        numeric_vals = pd.to_numeric(pd.Series(values), errors="coerce").values
+        mask_nan = np.isnan(numeric_vals)
+        if mask_nan.any():
+            numeric_vals = numeric_vals[~mask_nan]
 
-        if self.config.method == OutlierMethod.IQR:
-            mask = self._detect_iqr(values)
-        elif self.config.method == OutlierMethod.ZSCORE:
-            mask = self._detect_zscore(values)
-        elif self.config.method == OutlierMethod.PERCENTILE:
-            mask = self._detect_percentile(values)
-        elif self.config.method == OutlierMethod.MAD:
-            mask = self._detect_mad(values)
-        elif self.config.method == OutlierMethod.ISOLATION_FOREST:
-            mask = self._detect_isolation_forest(values)
-        elif self.config.method == OutlierMethod.DBSCAN:
-            mask = self._detect_dbscan(values)
+        effective_method = self.config.method
+        if effective_method == OutlierMethod.AUTO:
+            effective_method = self._auto_select_method(numeric_vals)
+            self._resolved_method = effective_method
+
+        if effective_method == OutlierMethod.IQR:
+            mask = self._detect_iqr(numeric_vals)
+        elif effective_method == OutlierMethod.ZSCORE:
+            mask = self._detect_zscore(numeric_vals)
+        elif effective_method == OutlierMethod.PERCENTILE:
+            mask = self._detect_percentile(numeric_vals)
+        elif effective_method == OutlierMethod.MAD:
+            mask = self._detect_mad(numeric_vals)
+        elif effective_method == OutlierMethod.ISOLATION_FOREST:
+            mask = self._detect_isolation_forest(numeric_vals)
+        elif effective_method == OutlierMethod.DBSCAN:
+            mask = self._detect_dbscan(numeric_vals)
         else:
-            raise ValueError(f"未知的异常值检测方法: {self.config.method}")
+            raise ValueError(f"未知的异常值检测方法: {effective_method}")
 
-        removed_count = int(mask.sum())
-        cleaned_df = df[~mask].copy()
+        full_mask = np.zeros(len(df), dtype=bool)
+        if mask_nan.any():
+            non_nan_idx = np.where(~mask_nan)[0]
+            full_mask[non_nan_idx] = mask
+        else:
+            full_mask = mask
+
+        removed_count = int(full_mask.sum())
+        cleaned_df = df[~full_mask].copy()
 
         stats = {
             "removed": removed_count,
-            "method": self.config.method.value,
+            "method": effective_method.value,
+            "method_resolved_from_auto": self.config.method == OutlierMethod.AUTO,
+            "auto_reason": self._auto_reason if self.config.method == OutlierMethod.AUTO else None,
             "threshold": self.config.threshold,
             "original_count": len(df),
             "remaining_count": len(cleaned_df),
             "target_column": target_col,
+            "nan_count_before_detect": int(mask_nan.sum()),
         }
 
-        if self.config.method == OutlierMethod.MAD:
+        if effective_method == OutlierMethod.MAD:
             stats["mad_threshold"] = self.config.mad_threshold
-        elif self.config.method == OutlierMethod.PERCENTILE:
+        elif effective_method == OutlierMethod.PERCENTILE:
             stats["percentile_low"] = self.config.percentile_low
             stats["percentile_high"] = self.config.percentile_high
-        elif self.config.method == OutlierMethod.ISOLATION_FOREST:
+        elif effective_method == OutlierMethod.ISOLATION_FOREST:
             stats["contamination"] = self.config.contamination
-        elif self.config.method == OutlierMethod.DBSCAN:
+        elif effective_method == OutlierMethod.DBSCAN:
             stats["eps"] = self.config.eps
             stats["min_samples"] = self.config.min_samples
 
@@ -141,6 +211,10 @@ class CohortAnalyzer:
         self.dsl_engine = CohortDSLEngine(config.dsl) if config.dsl else None
         self.outlier_remover = OutlierRemover(config.outlier) if config.outlier else None
         self._outlier_stats: Optional[Dict[str, Any]] = None
+        self._timezone_info: Optional[Dict[str, Any]] = None
+        self._analysis_warnings: List[str] = []
+        self._priority_warnings: List[str] = []
+        self._conflict_warnings: List[str] = []
 
     def _truncate_date(self, dt: pd.Series) -> pd.Series:
         if self.config.granularity == CohortGranularity.DAY:
@@ -166,6 +240,37 @@ class CohortAnalyzer:
         else:
             return "cohort_time"
 
+    def _sort_composite_events(self) -> Tuple[List[CompositeEventConfig], List[str]]:
+        from .config import CompositeEventConfig
+
+        events = self.config.composite_events
+        warnings = []
+
+        if not events:
+            return [], warnings
+
+        if self.config.detect_priority_cycle:
+            priority_groups: Dict[int, List[str]] = {}
+            for ev in events:
+                priority_groups.setdefault(ev.priority, []).append(ev.name)
+            for prio, names in priority_groups.items():
+                stop_on_match_events = [e for e in events if e.priority == prio and e.stop_on_match]
+                if len(stop_on_match_events) >= 2:
+                    sorted_names = sorted(names)
+                    warnings.append(
+                        f"优先级{prio}冲突: {stop_on_match_events} 均启用 stop_on_match，"
+                        f"将按名称排序: {sorted_names}"
+                    )
+
+        sort_key_func = lambda x: (
+            -x.priority,
+            0 if x.stop_on_match else 1,
+            x.name,
+        )
+        sorted_events = sorted(events, key=sort_key_func)
+
+        return sorted_events, warnings
+
     def _apply_composite_events(self, events_df: pd.DataFrame) -> pd.DataFrame:
         if self.config.event_type != EventType.COMPOSITE:
             return events_df
@@ -179,11 +284,7 @@ class CohortAnalyzer:
         if event_type_col not in df.columns:
             df[event_type_col] = self.config.event_type.value
 
-        sorted_events = sorted(
-            self.config.composite_events,
-            key=lambda x: x.priority,
-            reverse=True,
-        )
+        sorted_events, sort_warnings = self._sort_composite_events()
 
         remaining_indices = set(df.index)
         all_comp_rows = []
@@ -208,6 +309,9 @@ class CohortAnalyzer:
             except Exception as e:
                 raise ValueError(f"复合事件 {comp_event.name} 表达式计算失败: {e}")
 
+        if sort_warnings and hasattr(self, '_analysis_warnings'):
+            self._analysis_warnings.extend(sort_warnings)
+
         if all_comp_rows:
             result = pd.concat(all_comp_rows, ignore_index=True)
             result = result.drop_duplicates(
@@ -216,6 +320,62 @@ class CohortAnalyzer:
             return result
         else:
             return df.iloc[0:0]
+
+    def _normalize_timezone(self, series: pd.Series) -> Tuple[pd.Series, Dict[str, Any]]:
+        tz_cfg = self.config.rolling.timezone_handling
+        tz_info: Dict[str, Any] = {
+            "handling": tz_cfg.value if hasattr(tz_cfg, "value") else tz_cfg,
+            "original_tz": None,
+            "converted_to": None,
+            "dst_shifts_handled": 0,
+        }
+
+        if tz_cfg == TimeZoneHandling.NAIVE:
+            if hasattr(series.dt, 'tz') and series.dt.tz is not None:
+                tz_info["original_tz"] = str(series.dt.tz)
+                series = series.dt.tz_localize(None)
+                tz_info["converted_to"] = "naive (tz removed)"
+            return series, tz_info
+
+        if hasattr(series.dt, 'tz') and series.dt.tz is not None:
+            tz_info["original_tz"] = str(series.dt.tz)
+
+            if tz_cfg == TimeZoneHandling.UTC:
+                series = series.dt.tz_convert("UTC").dt.tz_localize(None)
+                tz_info["converted_to"] = "UTC (naive)"
+            elif tz_cfg == TimeZoneHandling.LOCAL:
+                target = self.config.rolling.target_timezone or "UTC"
+                series = series.dt.tz_convert(target).dt.tz_localize(None)
+                tz_info["converted_to"] = f"{target} (naive)"
+            elif tz_cfg == TimeZoneHandling.PRESERVE:
+                pass
+        else:
+            if tz_cfg == TimeZoneHandling.UTC:
+                try:
+                    series = series.dt.tz_localize("UTC").dt.tz_localize(None)
+                    tz_info["original_tz"] = "assumed UTC"
+                    tz_info["converted_to"] = "UTC (naive)"
+                except TypeError:
+                    pass
+            elif tz_cfg == TimeZoneHandling.LOCAL:
+                target = self.config.rolling.target_timezone or "UTC"
+                try:
+                    series = series.dt.tz_localize("UTC").dt.tz_convert(target).dt.tz_localize(None)
+                    tz_info["original_tz"] = "assumed UTC"
+                    tz_info["converted_to"] = f"{target} (naive)"
+                except TypeError:
+                    pass
+
+        if self.config.rolling.handle_dst and len(series) >= 2:
+            sorted_s = series.sort_values()
+            diffs = sorted_s.diff().dropna()
+            if len(diffs) > 0:
+                odd_diffs = diffs[(diffs < pd.Timedelta(0)) | (diffs > pd.Timedelta(days=1))]
+                tz_info["dst_shifts_handled"] = len(odd_diffs)
+                if len(odd_diffs) > 0:
+                    pass
+
+        return series, tz_info
 
     def _apply_dsl_filter(self, events_df: pd.DataFrame) -> pd.DataFrame:
         if not self.dsl_engine:
@@ -336,6 +496,12 @@ class CohortAnalyzer:
         df = self._remove_outliers(df)
 
         first_events = self._get_first_event_dsl(df)
+
+        first_events["cohort_time"], tz_info = self._normalize_timezone(
+            pd.to_datetime(first_events["cohort_time"])
+        )
+        self._timezone_info = tz_info
+
         first_events["cohort_period"] = self._truncate_date(first_events["cohort_time"])
 
         df = self._apply_composite_events(df)
@@ -350,6 +516,7 @@ class CohortAnalyzer:
 
         base = df.copy()
         base[time_col] = pd.to_datetime(base[time_col])
+        base[time_col], _ = self._normalize_timezone(base[time_col])
 
         base = base.merge(
             first_events[[user_col, "cohort_period"]],
@@ -462,8 +629,12 @@ class CohortAnalyzer:
             config_dict["rolling_window"] = {
                 "window_size": self.config.rolling.window_size,
                 "step": self.config.rolling.step,
+                "alignment": self.config.rolling.alignment.value,
                 "min_periods": self.config.rolling.min_periods,
+                "include_partial": self.config.rolling.include_partial,
             }
+            if self._timezone_info:
+                config_dict["rolling_window"]["timezone"] = self._timezone_info
 
         if self.config.outlier.enabled:
             config_dict["outlier"] = {
@@ -485,6 +656,12 @@ class CohortAnalyzer:
 
         if self._outlier_stats:
             summary["outlier_stats"] = self._outlier_stats
+        if self._timezone_info:
+            summary["timezone_info"] = self._timezone_info
+        if self._analysis_warnings:
+            summary["analysis_warnings"] = list(set(self._analysis_warnings))
+        if self._conflict_warnings:
+            summary["conflict_warnings"] = list(set(self._conflict_warnings))
 
         return CohortAnalysisResult(
             matrix=matrix,
