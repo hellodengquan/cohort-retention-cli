@@ -64,6 +64,16 @@ class TimeZoneHandling(str, Enum):
 
 
 @dataclass
+class TimezoneDBConfig:
+    enabled: bool = False
+    validate_tz_names: bool = True
+    lookup_historical_offsets: bool = True
+    ambiguous_time_strategy: str = "shift_forward"
+    nonexistent_time_strategy: str = "shift_forward"
+    cache_transitions: bool = True
+
+
+@dataclass
 class OutlierConfig:
     enabled: bool = False
     method: OutlierMethod = OutlierMethod.IQR
@@ -117,6 +127,7 @@ class RollingWindowConfig:
     timezone_handling: TimeZoneHandling = TimeZoneHandling.NAIVE
     target_timezone: Optional[str] = None
     handle_dst: bool = True
+    timezone_db: TimezoneDBConfig = field(default_factory=TimezoneDBConfig)
 
     def validate(self) -> List[str]:
         errors = []
@@ -141,6 +152,85 @@ class CompositeEventConfig:
     description: Optional[str] = None
     priority: int = 0
     stop_on_match: bool = False
+
+
+@dataclass
+class CompositeEventSubGraph:
+    nodes: List[str]
+    edges: List[Tuple[str, str]]
+    is_cycle: bool = False
+    description: str = ""
+
+    def to_dot(self) -> str:
+        lines = ["digraph composite_events {"]
+        lines.append('  rankdir=LR;')
+        lines.append('  node [shape=box, style=filled];')
+        for node in self.nodes:
+            color = "#ff6b6b" if self.is_cycle else "#74b9ff"
+            lines.append(f'  "{node}" [fillcolor="{color}"];')
+        for src, dst in self.edges:
+            style = " [color=red, penwidth=2]" if self.is_cycle else ""
+            lines.append(f'  "{src}" -> "{dst}"{style};')
+        lines.append("}")
+        return "\n".join(lines)
+
+
+def _tarjan_scc(adj: Dict[str, List[str]]) -> List[List[str]]:
+    index_counter = [0]
+    stack: List[str] = []
+    on_stack: Dict[str, bool] = {}
+    index: Dict[str, int] = {}
+    lowlink: Dict[str, int] = {}
+    result: List[List[str]] = []
+
+    def _strongconnect(v: str):
+        index[v] = index_counter[0]
+        lowlink[v] = index_counter[0]
+        index_counter[0] += 1
+        stack.append(v)
+        on_stack[v] = True
+
+        for w in adj.get(v, []):
+            if w not in index:
+                _strongconnect(w)
+                lowlink[v] = min(lowlink[v], lowlink[w])
+            elif on_stack.get(w, False):
+                lowlink[v] = min(lowlink[v], index[w])
+
+        if lowlink[v] == index[v]:
+            component = []
+            while True:
+                w = stack.pop()
+                on_stack[w] = False
+                component.append(w)
+                if w == v:
+                    break
+            result.append(component)
+
+    for v in adj:
+        if v not in index:
+            _strongconnect(v)
+
+    return result
+
+
+@dataclass
+class ConflictInfo:
+    message: str
+    severity: str = "error"
+    param_paths: List[str] = field(default_factory=list)
+    suggestion: Optional[str] = None
+    config_section: Optional[str] = None
+
+    def __str__(self) -> str:
+        location = ""
+        if self.config_section:
+            location = f"[{self.config_section}] "
+        paths = ""
+        if self.param_paths:
+            paths = f" (参数: {', '.join(self.param_paths)})"
+        sugg = f" → 建议: {self.suggestion}" if self.suggestion else ""
+        return f"{location}{self.message}{paths}{sugg}"
 
 
 @dataclass
@@ -231,6 +321,142 @@ class CohortConfig:
             errors.extend(self._validate_composite_priorities())
         return errors
 
+    def validate_with_warnings(self) -> Tuple[List[str], List[str]]:
+        hard_errors = []
+        for e in self.dsl.validate():
+            hard_errors.append(e)
+        for e in self.outlier.validate():
+            hard_errors.append(e)
+        for e in self.rolling.validate():
+            hard_errors.append(e)
+
+        conflict_infos = self._collect_all_conflicts()
+        hard_errors.extend(str(c) for c in conflict_infos if c.severity == "error")
+        warnings_list = [str(c) for c in conflict_infos if c.severity == "warning"]
+
+        if self.detect_priority_cycle:
+            for e in self._validate_composite_priorities():
+                hard_errors.append(e)
+
+        return hard_errors, warnings_list
+
+    def _collect_all_conflicts(self) -> List[ConflictInfo]:
+        conflicts: List[ConflictInfo] = []
+        if self.retention_type == RetentionType.ROLLING and not self.rolling.enabled:
+            conflicts.append(ConflictInfo(
+                message="retention_type=rolling 需要启用 rolling_enabled",
+                param_paths=["cohort.retention_type", "rolling.enabled"],
+                suggestion="设置 --rolling-enabled 或改 --retention-type standard",
+                config_section="cohort",
+            ))
+        if self.outlier.enabled and self.outlier.method == OutlierMethod.AUTO:
+            if self.outlier.target_column is None:
+                conflicts.append(ConflictInfo(
+                    message="outlier method=auto 需要指定 target_column",
+                    param_paths=["outlier.method", "outlier.target_column"],
+                    suggestion="设置 --outlier-target-col <列名>",
+                    config_section="outlier",
+                ))
+        if self.rolling.enabled and self.rolling.step > self.rolling.window_size:
+            conflicts.append(ConflictInfo(
+                message="rolling.step 不能大于 rolling.window_size",
+                param_paths=["rolling.step", "rolling.window_size"],
+                suggestion=f"当前 step={self.rolling.step}, window={self.rolling.window_size}，请调整",
+                config_section="rolling",
+            ))
+        if self.cohort_key == CohortKey.CUSTOM and not self.dsl.cohort_expression:
+            conflicts.append(ConflictInfo(
+                message="cohort_key=custom 需要设置 dsl.cohort_expression",
+                param_paths=["cohort.cohort_key", "dsl.cohort_expression"],
+                suggestion="设置 --dsl-cohort <表达式>",
+                config_section="dsl",
+            ))
+        if self.dsl.retry_on_recoverable and not self.dsl.error_recovery:
+            conflicts.append(ConflictInfo(
+                message="retry_on_recoverable=True 需要 error_recovery=True",
+                param_paths=["dsl.retry_on_recoverable", "dsl.error_recovery"],
+                suggestion="启用 --dsl-error-recovery",
+                config_section="dsl",
+            ))
+        if self.event_type == EventType.COMPOSITE:
+            names = [e.name for e in self.composite_events]
+            if len(names) != len(set(names)):
+                conflicts.append(ConflictInfo(
+                    message="复合事件名称不能重复",
+                    param_paths=["cohort.composite_events"],
+                    config_section="cohort",
+                ))
+
+        warnings: List[ConflictInfo] = []
+        if self.rolling.enabled and self.rolling.window_size > self.retention_days:
+            warnings.append(ConflictInfo(
+                message=f"滚动窗口({self.rolling.window_size}天) 大于留存天数({self.retention_days}天)",
+                param_paths=["rolling.window_size", "cohort.retention_days"],
+                suggestion="缩小窗口或延长留存期",
+                severity="warning",
+                config_section="rolling",
+            ))
+        if self.event_type == EventType.COMPOSITE and self.event_type_col is not None:
+            warnings.append(ConflictInfo(
+                message="使用复合事件时 event_type_col 将被忽略",
+                param_paths=["cohort.event_type_col", "cohort.event_type"],
+                severity="warning",
+                config_section="cohort",
+            ))
+        if self.outlier.method == OutlierMethod.DBSCAN and self.outlier.remove_users:
+            warnings.append(ConflictInfo(
+                message="DBSCAN + remove_users 可能过度剔除",
+                param_paths=["outlier.method", "outlier.remove_users"],
+                severity="warning",
+                config_section="outlier",
+            ))
+        if self.dsl.strict_mode and self.dsl.error_recovery:
+            warnings.append(ConflictInfo(
+                message="strict_mode 将覆盖 error_recovery=True",
+                param_paths=["dsl.strict_mode", "dsl.error_recovery"],
+                severity="warning",
+                config_section="dsl",
+            ))
+        if self.dsl.coalesce_on_error and not self.dsl.error_recovery:
+            warnings.append(ConflictInfo(
+                message="coalesce_on_error=True 但 error_recovery=False",
+                param_paths=["dsl.coalesce_on_error", "dsl.error_recovery"],
+                severity="warning",
+                config_section="dsl",
+            ))
+        if self.outlier.enabled and (self.outlier.remove_users or self.outlier.remove_cohorts):
+            if self.min_users < 5:
+                warnings.append(ConflictInfo(
+                    message="启用异常值剔除时建议 min_users >= 5",
+                    param_paths=["outlier.enabled", "cohort.min_users"],
+                    severity="warning",
+                    config_section="cohort",
+                ))
+        if self.granularity in (CohortGranularity.MONTH, CohortGranularity.QUARTER) and self.retention_days < 90:
+            warnings.append(ConflictInfo(
+                message=f"粒度={self.granularity.value} 建议 retention_days >= 90",
+                param_paths=["cohort.granularity", "cohort.retention_days"],
+                severity="warning",
+                config_section="cohort",
+            ))
+        if self.rolling.alignment == RollingAlignment.CENTER and self.rolling.window_size % 2 == 0:
+            warnings.append(ConflictInfo(
+                message="CENTER 对齐建议使用奇数窗口大小",
+                param_paths=["rolling.alignment", "rolling.window_size"],
+                severity="warning",
+                config_section="rolling",
+            ))
+        if self.outlier.method in (OutlierMethod.ISOLATION_FOREST, OutlierMethod.DBSCAN):
+            if self.outlier.auto_min_rows < 500:
+                warnings.append(ConflictInfo(
+                    message="机器学习类异常检测建议样本量 >= 500",
+                    param_paths=["outlier.method", "outlier.auto_min_rows"],
+                    severity="warning",
+                    config_section="outlier",
+                ))
+
+        return conflicts + warnings
+
     def _validate_composite_priorities(self) -> List[str]:
         errors = []
         if not self.composite_events:
@@ -262,88 +488,44 @@ class CohortConfig:
                     if a.priority >= b.priority:
                         adj[a.name].append(b.name)
 
-            color: Dict[str, int] = {e.name: 0 for e in stop_events}
-            cycle_found = None
-
-            def _dfs(node: str, path: List[str]) -> Optional[List[str]]:
-                color[node] = 1
-                for nb in adj.get(node, []):
-                    if color[nb] == 1:
-                        idx = path.index(nb) if nb in path else -1
-                        if idx >= 0:
-                            return path[idx:] + [nb]
-                        return [nb, node]
-                    elif color[nb] == 0:
-                        res = _dfs(nb, path + [nb])
-                        if res:
-                            return res
-                color[node] = 2
-                return None
-
-            for ev in stop_events:
-                if color[ev.name] == 0:
-                    cycle = _dfs(ev.name, [ev.name])
-                    if cycle:
-                        cycle_found = cycle
-                        break
-
-            if cycle_found:
+            sccs = _tarjan_scc(adj)
+            cycle_sccs = [c for c in sccs if len(c) > 1]
+            for scc in cycle_sccs:
+                cycle_edges = []
+                for node in scc:
+                    for nb in adj.get(node, []):
+                        if nb in scc:
+                            cycle_edges.append((node, nb))
+                subgraph = CompositeEventSubGraph(
+                    nodes=list(scc),
+                    edges=cycle_edges,
+                    is_cycle=True,
+                    description=f"优先级环: {' -> '.join(scc)} -> {scc[0]}"
+                )
                 errors.append(
-                    f"检测到 stop_on_match 优先级环: {' -> '.join(cycle_found)}，"
+                    f"检测到 stop_on_match 优先级环: {' -> '.join(scc)} -> {scc[0]}，"
+                    f"子图 DOT:\n{subgraph.to_dot()}，"
                     f"请调整优先级或部分事件禁用 stop_on_match"
+                )
+
+            non_cycle_sccs = [c for c in sccs if len(c) == 1]
+            for scc in non_cycle_sccs:
+                node = scc[0]
+                out_edges = [(node, nb) for nb in adj.get(node, [])]
+                if not out_edges:
+                    continue
+                subgraph = CompositeEventSubGraph(
+                    nodes=[node] + [nb for _, nb in out_edges],
+                    edges=out_edges,
+                    is_cycle=False,
+                    description=f"事件 '{node}' 依赖: {[nb for _, nb in out_edges]}"
                 )
 
         return errors
 
     def _validate_conflicts(self) -> List[str]:
-        conflicts = []
-        warnings = []
-
-        if self.retention_type == RetentionType.ROLLING and not self.rolling.enabled:
-            conflicts.append("retention_type=rolling 需要启用 rolling_enabled")
-        if self.outlier.enabled and self.outlier.method == OutlierMethod.AUTO:
-            if self.outlier.target_column is None:
-                conflicts.append("outlier method=auto 需要指定 target_column")
-        if self.rolling.enabled and self.rolling.window_size > self.retention_days:
-            warnings.append(
-                f"滚动窗口({self.rolling.window_size}天) 大于留存天数({self.retention_days}天)，"
-                f"建议缩小窗口或延长留存期"
-            )
-        if self.event_type == EventType.COMPOSITE and self.event_type_col is not None:
-            warnings.append("使用复合事件时 event_type_col 将被忽略，改用表达式定义")
-        if self.outlier.method == OutlierMethod.DBSCAN and self.outlier.remove_users:
-            warnings.append("DBSCAN + remove_users 可能过度剔除，建议谨慎使用")
-        if self.dsl.strict_mode and self.dsl.error_recovery:
-            warnings.append("strict_mode 将覆盖 error_recovery=True 的行为，不做错误恢复")
-        if self.dsl.retry_on_recoverable and not self.dsl.error_recovery:
-            conflicts.append("retry_on_recoverable=True 需要 error_recovery=True")
-        if self.outlier.enabled and (self.outlier.remove_users or self.outlier.remove_cohorts):
-            if self.min_users < 5:
-                warnings.append("启用异常值剔除时建议 min_users >= 5 以避免队列过度减少")
-        if self.cohort_key == CohortKey.CUSTOM and not self.dsl.cohort_expression:
-            conflicts.append("cohort_key=custom 需要设置 dsl.cohort_expression")
-        if self.granularity in (CohortGranularity.MONTH, CohortGranularity.QUARTER) and self.retention_days < 90:
-            warnings.append(f"粒度={self.granularity.value} 建议 retention_days >= 90 以获得有意义的结果")
-        if self.rolling.enabled and self.rolling.step > self.rolling.window_size:
-            conflicts.append("rolling.step 不能大于 rolling.window_size")
-        if self.outlier.method == OutlierMethod.ISOLATION_FOREST and self.outlier.min_samples >= 2:
-            pass
-        if self.event_type == EventType.COMPOSITE:
-            names = [e.name for e in self.composite_events]
-            if len(names) != len(set(names)):
-                conflicts.append("复合事件名称不能重复")
-            for e in self.composite_events:
-                if e.stop_on_match and self.min_users < 2:
-                    warnings.append(f"复合事件 '{e.name}' 启用 stop_on_match 建议 min_users >= 2")
-        if self.dsl.coalesce_on_error and not self.dsl.error_recovery:
-            warnings.append("coalesce_on_error=True 但 error_recovery=False，coalesce 将不生效")
-        if self.rolling.alignment == RollingAlignment.CENTER and self.rolling.window_size % 2 == 0:
-            warnings.append("CENTER 对齐建议使用奇数窗口大小以获得对称窗口")
-        if self.outlier.method in (OutlierMethod.ISOLATION_FOREST, OutlierMethod.DBSCAN):
-            if self.outlier.auto_min_rows < 500:
-                warnings.append("机器学习类异常检测建议样本量 >= 500")
-
-        return conflicts
+        all_infos = self._collect_all_conflicts()
+        return [str(c) for c in all_infos if c.severity == "error"]
 
 
 @dataclass
@@ -394,8 +576,36 @@ class ParquetCodecMetrics:
     row_group_count: int = 0
     spark_compatible: bool = True
     note: Optional[str] = None
+    write_throughput_rows_per_sec: float = 0.0
+    read_throughput_rows_per_sec: float = 0.0
+    overall_score: float = 0.0
+    best_for: Optional[str] = None
+
+    def compute_derived_metrics(self) -> None:
+        if self.write_time_ms > 0 and self.row_count > 0:
+            self.write_throughput_rows_per_sec = self.row_count / (self.write_time_ms / 1000.0)
+        if self.read_time_ms > 0 and self.row_count > 0:
+            self.read_throughput_rows_per_sec = self.row_count / (self.read_time_ms / 1000.0)
+        speed_score = 0.0
+        if self.write_time_ms > 0 and self.read_time_ms > 0:
+            total_ms = self.write_time_ms + self.read_time_ms
+            speed_score = 1.0 / (total_ms / 1000.0)
+        compression_score = self.compression_ratio if self.compression_ratio > 0 else 0
+        self.overall_score = round(0.4 * speed_score + 0.4 * compression_score + 0.2 * (1.0 if self.spark_compatible else 0.0), 4)
+        if self.overall_score > 0:
+            if self.compression_ratio >= 3.0 and self.read_time_ms <= 50:
+                self.best_for = "归档存储"
+            elif self.write_throughput_rows_per_sec > 10000:
+                self.best_for = "实时写入"
+            elif self.read_throughput_rows_per_sec > 10000:
+                self.best_for = "实时查询"
+            elif self.spark_compatible:
+                self.best_for = "Spark 兼容"
+            else:
+                self.best_for = "通用"
 
     def to_dict(self) -> dict:
+        self.compute_derived_metrics()
         return {
             "compression": self.compression,
             "original_bytes": self.original_bytes,
@@ -407,6 +617,10 @@ class ParquetCodecMetrics:
             "row_group_count": self.row_group_count,
             "spark_compatible": self.spark_compatible,
             "note": self.note,
+            "write_throughput_rows_per_sec": round(self.write_throughput_rows_per_sec, 2),
+            "read_throughput_rows_per_sec": round(self.read_throughput_rows_per_sec, 2),
+            "overall_score": self.overall_score,
+            "best_for": self.best_for,
         }
 
 
@@ -461,27 +675,73 @@ class ReportConfig:
         return errors
 
     def _validate_report_conflicts(self) -> List[str]:
-        conflicts = []
-        warnings = []
-        valid_formats = {"markdown", "json", "html"}
+        conflicts: List[ConflictInfo] = []
+
         if "html" not in self.formats and self.ssr_enabled:
-            warnings.append("ssr_enabled=True 但未选择 html 格式，SSR 将不生效")
+            conflicts.append(ConflictInfo(
+                message="ssr_enabled=True 但未选择 html 格式",
+                param_paths=["report.formats", "report.ssr_enabled"],
+                suggestion="添加 --format html",
+                severity="warning",
+                config_section="report",
+            ))
         if "html" not in self.formats and self.seo.title != "留存队列分析报告":
-            warnings.append("自定义 SEO 设置需要 html 格式才会生效")
-        if self.matrix_format == "parquet":
-            pass
+            conflicts.append(ConflictInfo(
+                message="自定义 SEO 设置需要 html 格式才会生效",
+                param_paths=["report.formats", "seo.title"],
+                severity="warning",
+                config_section="report",
+            ))
         if self.parquet.benchmark_codecs and self.matrix_format != "parquet":
-            warnings.append("parquet benchmark_codecs 需要 matrix_format=parquet 才会运行基准测试")
+            conflicts.append(ConflictInfo(
+                message="benchmark_codecs 需要 matrix_format=parquet",
+                param_paths=["parquet.benchmark_codecs", "report.matrix_format"],
+                suggestion="设置 --matrix-format parquet",
+                severity="warning",
+                config_section="parquet",
+            ))
         if self.ssr_minify and not self.ssr_enabled:
-            conflicts.append("ssr_minify=True 需要 ssr_enabled=True")
+            conflicts.append(ConflictInfo(
+                message="ssr_minify=True 需要 ssr_enabled=True",
+                param_paths=["report.ssr_minify", "report.ssr_enabled"],
+                suggestion="启用 --ssr-enabled",
+                config_section="report",
+            ))
         if self.ssr_render_charts and not self.ssr_enabled:
-            warnings.append("ssr_render_charts=True 但 ssr_enabled=False，图表渲染将被跳过")
+            conflicts.append(ConflictInfo(
+                message="ssr_render_charts=True 但 ssr_enabled=False",
+                param_paths=["report.ssr_render_charts", "report.ssr_enabled"],
+                severity="warning",
+                config_section="report",
+            ))
         if self.ssr_embed_data and not self.ssr_enabled:
-            warnings.append("ssr_embed_data=True 但 ssr_enabled=False，数据嵌入将被跳过")
+            conflicts.append(ConflictInfo(
+                message="ssr_embed_data=True 但 ssr_enabled=False",
+                param_paths=["report.ssr_embed_data", "report.ssr_enabled"],
+                severity="warning",
+                config_section="report",
+            ))
         if self.enable_conflict_suggestions and not self.detect_conflicts:
-            warnings.append("enable_conflict_suggestions=True 但 detect_conflicts=False，无法生成建议")
+            conflicts.append(ConflictInfo(
+                message="enable_conflict_suggestions=True 但 detect_conflicts=False",
+                param_paths=["report.enable_conflict_suggestions", "report.detect_conflicts"],
+                severity="warning",
+                config_section="report",
+            ))
         if self.parquet.spark_compatible and self.parquet.compression == "brotli":
-            warnings.append("Spark 2.x 对 brotli 压缩支持有限，建议用 snappy/zstd")
+            conflicts.append(ConflictInfo(
+                message="Spark 2.x 对 brotli 压缩支持有限",
+                param_paths=["parquet.spark_compatible", "parquet.compression"],
+                suggestion="建议用 snappy/zstd",
+                severity="warning",
+                config_section="parquet",
+            ))
         if self.parquet.coerce_timestamps is None and self.parquet.spark_compatible:
-            warnings.append("Spark 兼容模式建议设置 coerce_timestamps='us' 或 'ms'")
-        return conflicts + warnings
+            conflicts.append(ConflictInfo(
+                message="Spark 兼容模式建议设置 coerce_timestamps='us' 或 'ms'",
+                param_paths=["parquet.coerce_timestamps", "parquet.spark_compatible"],
+                severity="warning",
+                config_section="parquet",
+            ))
+
+        return [str(c) for c in conflicts if c.severity == "error"]

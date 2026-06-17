@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from datetime import date
+from datetime import date, datetime
 from typing import Optional, Dict, Any, List, Tuple
 import warnings
 
@@ -14,17 +14,113 @@ from .config import (
     RollingAlignment,
     TimeZoneHandling,
     CompositeEventConfig,
+    TimezoneDBConfig,
 )
 from .models import RetentionMatrix, FunnelResult, FunnelStep, CohortAnalysisResult
 from .loaders import BaseDataLoader
 from .dsl import CohortDSLEngine
 
 
+class TimezoneHistoryDB:
+    def __init__(self, config: TimezoneDBConfig):
+        self.config = config
+        self._transition_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+    def validate_timezone_name(self, tz_name: str) -> Tuple[bool, Optional[str]]:
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(tz_name)
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    def get_historical_offset(self, tz_name: str, dt: datetime) -> Optional[Dict[str, Any]]:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+            aware_dt = dt.replace(tzinfo=tz)
+            utc_offset = aware_dt.utcoffset()
+            dst_offset = aware_dt.dst()
+            return {
+                "timezone": tz_name,
+                "utc_offset_seconds": int(utc_offset.total_seconds()) if utc_offset else 0,
+                "dst_offset_seconds": int(dst_offset.total_seconds()) if dst_offset else 0,
+                "is_dst": bool(dst_offset and dst_offset.total_seconds() != 0),
+                "datetime": dt.isoformat(),
+            }
+        except Exception:
+            return None
+
+    def get_transitions(self, tz_name: str, year: int) -> List[Dict[str, Any]]:
+        if self.config.cache_transitions and tz_name in self._transition_cache:
+            cached = self._transition_cache[tz_name]
+            return [t for t in cached if t.get("year") == year]
+
+        transitions = []
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+            for month in range(1, 13):
+                for day in [1, 15, 28]:
+                    try:
+                        dt = datetime(year, month, min(day, 28), 12, 0, 0)
+                        aware = dt.replace(tzinfo=tz)
+                        dst = aware.dst()
+                        if dst and dst.total_seconds() != 0:
+                            transitions.append({
+                                "year": year,
+                                "month": month,
+                                "day": day,
+                                "is_dst": True,
+                                "utc_offset_seconds": int(aware.utcoffset().total_seconds()),
+                                "dst_offset_seconds": int(dst.total_seconds()),
+                            })
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        if self.config.cache_transitions:
+            self._transition_cache.setdefault(tz_name, []).extend(transitions)
+        return transitions
+
+    def resolve_ambiguous_time(self, dt: datetime, tz_name: str) -> datetime:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+            if self.config.ambiguous_time_strategy == "shift_forward":
+                return dt.replace(tzinfo=tz, fold=0)
+            else:
+                return dt.replace(tzinfo=tz, fold=1)
+        except Exception:
+            return dt
+
+    def resolve_nonexistent_time(self, dt: datetime, tz_name: str) -> datetime:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+            if self.config.nonexistent_time_strategy == "shift_forward":
+                return (dt + pd.Timedelta(hours=1)).replace(tzinfo=tz)
+            else:
+                return (dt - pd.Timedelta(hours=1)).replace(tzinfo=tz)
+        except Exception:
+            return dt
+
+
 class OutlierRemover:
+    _FALLBACK_CHAIN = {
+        OutlierMethod.ISOLATION_FOREST: [OutlierMethod.MAD, OutlierMethod.IQR],
+        OutlierMethod.DBSCAN: [OutlierMethod.PERCENTILE, OutlierMethod.IQR],
+        OutlierMethod.ZSCORE: [OutlierMethod.IQR],
+        OutlierMethod.MAD: [OutlierMethod.IQR],
+        OutlierMethod.PERCENTILE: [OutlierMethod.IQR],
+    }
+
     def __init__(self, config: "OutlierConfig"):
         self.config = config
         self._resolved_method: Optional[OutlierMethod] = None
         self._auto_reason: Optional[str] = None
+        self._fallback_trace: List[str] = []
 
     def _detect_iqr(self, values: np.ndarray) -> np.ndarray:
         q1, q3 = np.percentile(values, [25, 75])
@@ -153,20 +249,8 @@ class OutlierRemover:
             effective_method = self._auto_select_method(numeric_vals)
             self._resolved_method = effective_method
 
-        if effective_method == OutlierMethod.IQR:
-            mask = self._detect_iqr(numeric_vals)
-        elif effective_method == OutlierMethod.ZSCORE:
-            mask = self._detect_zscore(numeric_vals)
-        elif effective_method == OutlierMethod.PERCENTILE:
-            mask = self._detect_percentile(numeric_vals)
-        elif effective_method == OutlierMethod.MAD:
-            mask = self._detect_mad(numeric_vals)
-        elif effective_method == OutlierMethod.ISOLATION_FOREST:
-            mask = self._detect_isolation_forest(numeric_vals)
-        elif effective_method == OutlierMethod.DBSCAN:
-            mask = self._detect_dbscan(numeric_vals)
-        else:
-            raise ValueError(f"未知的异常值检测方法: {effective_method}")
+        self._fallback_trace = []
+        mask = self._detect_with_fallback(effective_method, numeric_vals)
 
         full_mask = np.zeros(len(df), dtype=bool)
         if mask_nan.any():
@@ -188,6 +272,7 @@ class OutlierRemover:
             "remaining_count": len(cleaned_df),
             "target_column": target_col,
             "nan_count_before_detect": int(mask_nan.sum()),
+            "fallback_trace": list(self._fallback_trace) if self._fallback_trace else None,
         }
 
         if effective_method == OutlierMethod.MAD:
@@ -202,6 +287,31 @@ class OutlierRemover:
             stats["min_samples"] = self.config.min_samples
 
         return cleaned_df, stats
+
+    def _detect_with_fallback(self, method: OutlierMethod, values: np.ndarray) -> np.ndarray:
+        chain = [method] + self._FALLBACK_CHAIN.get(method, [])
+        last_exc = None
+        for candidate in chain:
+            try:
+                if candidate == OutlierMethod.IQR:
+                    return self._detect_iqr(values)
+                elif candidate == OutlierMethod.ZSCORE:
+                    return self._detect_zscore(values)
+                elif candidate == OutlierMethod.PERCENTILE:
+                    return self._detect_percentile(values)
+                elif candidate == OutlierMethod.MAD:
+                    return self._detect_mad(values)
+                elif candidate == OutlierMethod.ISOLATION_FOREST:
+                    return self._detect_isolation_forest(values)
+                elif candidate == OutlierMethod.DBSCAN:
+                    return self._detect_dbscan(values)
+            except Exception as exc:
+                last_exc = exc
+                if candidate != chain[-1]:
+                    self._fallback_trace.append(
+                        f"{candidate.value}→{chain[chain.index(candidate)+1].value} ({type(exc).__name__}: {exc})"
+                    )
+        raise ValueError(f"所有回退方法均失败，最终异常: {last_exc}")
 
 
 class CohortAnalyzer:
@@ -323,12 +433,22 @@ class CohortAnalyzer:
 
     def _normalize_timezone(self, series: pd.Series) -> Tuple[pd.Series, Dict[str, Any]]:
         tz_cfg = self.config.rolling.timezone_handling
+        tz_db_cfg = self.config.rolling.timezone_db
         tz_info: Dict[str, Any] = {
             "handling": tz_cfg.value if hasattr(tz_cfg, "value") else tz_cfg,
             "original_tz": None,
             "converted_to": None,
             "dst_shifts_handled": 0,
+            "tz_db_enabled": tz_db_cfg.enabled,
+            "historical_offsets_queried": 0,
+            "tz_validation": None,
         }
+
+        tz_db = TimezoneHistoryDB(tz_db_cfg) if tz_db_cfg.enabled else None
+
+        if tz_db and tz_db_cfg.validate_tz_names and self.config.rolling.target_timezone:
+            valid, err = tz_db.validate_timezone_name(self.config.rolling.target_timezone)
+            tz_info["tz_validation"] = {"name": self.config.rolling.target_timezone, "valid": valid, "error": err}
 
         if tz_cfg == TimeZoneHandling.NAIVE:
             if hasattr(series.dt, 'tz') and series.dt.tz is not None:
@@ -372,8 +492,22 @@ class CohortAnalyzer:
             if len(diffs) > 0:
                 odd_diffs = diffs[(diffs < pd.Timedelta(0)) | (diffs > pd.Timedelta(days=1))]
                 tz_info["dst_shifts_handled"] = len(odd_diffs)
-                if len(odd_diffs) > 0:
-                    pass
+
+        if tz_db and tz_db_cfg.lookup_historical_offsets and self.config.rolling.target_timezone:
+            sample_size = min(3, len(series))
+            if sample_size > 0:
+                sample_dates = series.dropna().head(sample_size)
+                offsets_queried = 0
+                for val in sample_dates:
+                    dt_val = pd.Timestamp(val).to_pydatetime()
+                    offset_info = tz_db.get_historical_offset(self.config.rolling.target_timezone, dt_val)
+                    if offset_info:
+                        offsets_queried += 1
+                tz_info["historical_offsets_queried"] = offsets_queried
+                tz_info["historical_transitions_sample"] = tz_db.get_transitions(
+                    self.config.rolling.target_timezone,
+                    pd.Timestamp(series.iloc[0]).year if len(series) > 0 else datetime.now().year,
+                )[:2]
 
         return series, tz_info
 

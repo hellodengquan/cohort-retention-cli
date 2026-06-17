@@ -44,6 +44,11 @@ class PostgreSqlDataLoader(BaseDataLoader):
         self._savepoint_counter: int = 0
         self._transaction_stack: List[Dict[str, Any]] = []
         self._transaction_stats: Dict[str, Any] = {}
+        self._savepoint_chain: List[Dict[str, Any]] = []
+
+    @property
+    def savepoint_chain(self) -> List[Dict[str, Any]]:
+        return list(self._savepoint_chain)
 
     def _build_connection_string(self, for_sqlalchemy: bool = False) -> str:
         cfg = self.source_config
@@ -90,11 +95,23 @@ class PostgreSqlDataLoader(BaseDataLoader):
     def savepoint(self, conn: Any, name: Optional[str] = None) -> Iterator[str]:
         self._savepoint_counter += 1
         sp_name = name or f"sp_{id(conn)}_{self._savepoint_counter}"
+        sp_record = {
+            "name": sp_name,
+            "depth": len(self._transaction_stack),
+            "chain_index": len(self._savepoint_chain),
+            "created_at": time.time(),
+            "status": "created",
+            "rolled_back_to": False,
+            "released": False,
+        }
         try:
             with conn.cursor() as cur:
                 cur.execute(f'SAVEPOINT "{sp_name}"')
+            self._savepoint_chain.append(sp_record)
             yield sp_name
         except Exception as exc:
+            sp_record["status"] = "error"
+            sp_record["rolled_back_to"] = True
             try:
                 with conn.cursor() as cur:
                     cur.execute(f'ROLLBACK TO SAVEPOINT "{sp_name}"')
@@ -102,11 +119,57 @@ class PostgreSqlDataLoader(BaseDataLoader):
                 pass
             raise
         else:
+            sp_record["released"] = True
+            sp_record["status"] = "released"
             try:
                 with conn.cursor() as cur:
                     cur.execute(f'RELEASE SAVEPOINT "{sp_name}"')
             except Exception:
-                pass
+                sp_record["status"] = "released_with_error"
+
+    def partial_commit(
+        self,
+        conn: Any,
+        operations: List[Dict[str, Any]],
+        continue_on_error: bool = False,
+    ) -> List[Dict[str, Any]]:
+        results = []
+        for i, op in enumerate(operations):
+            sp_name = f"partial_{id(conn)}_{i}"
+            op_result = {"index": i, "operation": op.get("name", f"op_{i}"), "status": "pending"}
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f'SAVEPOINT "{sp_name}"')
+                self._savepoint_chain.append({
+                    "name": sp_name,
+                    "depth": len(self._transaction_stack),
+                    "chain_index": len(self._savepoint_chain),
+                    "created_at": time.time(),
+                    "status": "created",
+                    "rolled_back_to": False,
+                    "released": False,
+                })
+                sql = op.get("sql")
+                params = op.get("params")
+                if sql:
+                    with conn.cursor() as cur:
+                        cur.execute(sql, params or ())
+                    op_result["status"] = "committed"
+                    op_result["rowcount"] = cur.rowcount
+                    with conn.cursor() as cur:
+                        cur.execute(f'RELEASE SAVEPOINT "{sp_name}"')
+            except Exception as exc:
+                op_result["status"] = "rolled_back"
+                op_result["error"] = str(exc)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(f'ROLLBACK TO SAVEPOINT "{sp_name}"')
+                except Exception:
+                    pass
+                if not continue_on_error:
+                    break
+            results.append(op_result)
+        return results
 
     @contextmanager
     def transaction(

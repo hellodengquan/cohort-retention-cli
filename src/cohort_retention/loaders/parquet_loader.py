@@ -155,6 +155,10 @@ class ParquetDataLoader(BaseDataLoader):
                 metrics_list.append(m)
 
         metrics_list.sort(key=lambda x: x.compressed_bytes)
+
+        for m in metrics_list:
+            m.compute_derived_metrics()
+
         self.parquet_config.codec_metrics = metrics_list
         return metrics_list
 

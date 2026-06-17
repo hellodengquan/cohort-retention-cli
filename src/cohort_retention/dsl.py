@@ -1,6 +1,7 @@
 import re
 import ast
 import operator
+import locale as _locale
 from typing import Any, Dict, Optional, Callable, List, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -11,6 +12,78 @@ import numpy as np
 from .config import DSLErrorCode
 
 
+_I18N_MESSAGES: Dict[str, Dict[str, str]] = {
+    "zh_CN": {
+        "E001": "未找到变量或列",
+        "E002": "类型不匹配",
+        "E003": "除零错误",
+        "E004": "空值错误",
+        "E005": "函数错误",
+        "E006": "参数缺失",
+        "E007": "语法错误",
+        "E999": "未知错误",
+        "suggestion.E001": "检查列名拼写或使用 coalesce(col_name, 默认值) 提供备选",
+        "suggestion.E002": "使用 cast 函数转换类型: cast(列名, 'numeric')",
+        "suggestion.E003": "使用 nullif(denominator, 0) 或 coalesce 避免除零",
+        "suggestion.E004": "使用 coalesce(col, 默认值) 处理空值",
+        "suggestion.E005": "检查函数名和参数个数是否正确",
+        "suggestion.E006": "确认函数调用已提供所有必需参数",
+        "suggestion.E007": "检查表达式语法，确认括号和操作符匹配",
+    },
+    "en_US": {
+        "E001": "Variable or column not found",
+        "E002": "Type mismatch",
+        "E003": "Division by zero",
+        "E004": "Null value error",
+        "E005": "Function error",
+        "E006": "Missing argument",
+        "E007": "Syntax error",
+        "E999": "Unknown error",
+        "suggestion.E001": "Check column name spelling or use coalesce(col_name, default_value)",
+        "suggestion.E002": "Use cast function to convert type: cast(column, 'numeric')",
+        "suggestion.E003": "Use nullif(denominator, 0) or coalesce to avoid division by zero",
+        "suggestion.E004": "Use coalesce(col, default_value) to handle null values",
+        "suggestion.E005": "Check function name and number of arguments",
+        "suggestion.E006": "Ensure all required arguments are provided",
+        "suggestion.E007": "Check expression syntax, confirm brackets and operators match",
+    },
+    "ja_JP": {
+        "E001": "変数または列が見つかりません",
+        "E002": "型の不一致",
+        "E003": "ゼロ除算エラー",
+        "E004": "NULL値エラー",
+        "E005": "関数エラー",
+        "E006": "引数不足",
+        "E007": "構文エラー",
+        "E999": "不明なエラー",
+        "suggestion.E001": "列名のスペルを確認するか、coalesce(列名, デフォルト値) を使用してください",
+        "suggestion.E002": "cast関数で型変換: cast(列名, 'numeric')",
+        "suggestion.E003": "nullif(分母, 0) または coalesce でゼロ除算を回避",
+        "suggestion.E004": "coalesce(列, デフォルト値) でNULL値を処理",
+        "suggestion.E005": "関数名と引数の数を確認してください",
+        "suggestion.E006": "すべての必須引数が提供されていることを確認",
+        "suggestion.E007": "式の構文を確認、括弧と演算子の一致を確認",
+    },
+}
+
+
+def _detect_locale() -> str:
+    try:
+        loc = _locale.getdefaultlocale()[0]
+        if loc:
+            return loc.replace("-", "_")
+    except Exception:
+        pass
+    return "en_US"
+
+
+def _get_i18n_message(code: DSLErrorCode, locale: Optional[str] = None, key_prefix: str = "") -> str:
+    target = locale or _detect_locale()
+    code_key = key_prefix + code.value if key_prefix else code.value
+    messages = _I18N_MESSAGES.get(target, _I18N_MESSAGES.get("en_US", {}))
+    return messages.get(code_key, code_key)
+
+
 class DSLError(Exception):
     def __init__(
         self,
@@ -18,12 +91,17 @@ class DSLError(Exception):
         code: DSLErrorCode = DSLErrorCode.UNKNOWN,
         recoverable: bool = True,
         suggestion: Optional[str] = None,
+        locale: Optional[str] = None,
     ):
-        super().__init__(f"[{code.value}] {message}" + (f" (建议: {suggestion})" if suggestion else ""))
+        i18n_label = _get_i18n_message(code, locale)
+        i18n_suggestion = _get_i18n_message(code, locale, key_prefix="suggestion.")
+        display_suggestion = suggestion or i18n_suggestion
+        super().__init__(f"[{code.value}] {i18n_label}: {message}" + (f" (建议: {display_suggestion})" if display_suggestion else ""))
         self.code = code
         self.recoverable = recoverable
-        self.suggestion = suggestion
+        self.suggestion = display_suggestion
         self.message = message
+        self.locale = locale or _detect_locale()
 
 
 @dataclass
@@ -48,6 +126,7 @@ class DSLErrorRecovery:
         error_code_enabled: bool = True,
         retry_on_recoverable: bool = False,
         retry_max_attempts: int = 1,
+        locale: Optional[str] = None,
     ):
         self.enabled = enabled
         self.coalesce_on_error = coalesce_on_error
@@ -58,6 +137,7 @@ class DSLErrorRecovery:
         self.error_code_enabled = error_code_enabled
         self.retry_on_recoverable = retry_on_recoverable
         self.retry_max_attempts = retry_max_attempts
+        self.locale = locale or _detect_locale()
         self.warnings: List[str] = []
         self.error_log: List[DSLErrorRecord] = []
 
@@ -117,21 +197,7 @@ class DSLErrorRecovery:
         raise DSLError(str(error), code=code, recoverable=recoverable, suggestion=suggestion)
 
     def _suggest_fix(self, code: DSLErrorCode, error: Exception) -> Optional[str]:
-        if code == DSLErrorCode.COLUMN_NOT_FOUND:
-            return "检查列名拼写或使用 coalesce(col_name, 默认值) 提供备选"
-        if code == DSLErrorCode.TYPE_MISMATCH:
-            return "使用 cast 函数转换类型: cast(列名, 'numeric')"
-        if code == DSLErrorCode.DIVISION_BY_ZERO:
-            return "使用 nullif(denominator, 0) 或 coalesce 避免除零"
-        if code == DSLErrorCode.NULL_VALUE:
-            return "使用 coalesce(col, 默认值) 处理空值"
-        if code == DSLErrorCode.PARSE_ERROR:
-            return "检查表达式语法，确认括号和操作符匹配"
-        if code == DSLErrorCode.FUNCTION_ERROR:
-            return "检查函数名和参数个数是否正确"
-        if code == DSLErrorCode.ARGUMENT_MISSING:
-            return "确认函数调用已提供所有必需参数"
-        return None
+        return _get_i18n_message(code, self.locale, key_prefix="suggestion.")
 
     def _get_default_value(self, dtype_hint: Optional[str], error: Exception) -> Any:
         if dtype_hint == "numeric":

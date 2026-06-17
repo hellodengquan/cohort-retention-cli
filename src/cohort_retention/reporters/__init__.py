@@ -312,29 +312,73 @@ class HtmlReporter:
             return ""
 
         summary = result.summary or {}
-        sd = {
+        now_str = datetime.now().strftime("%Y-%m-%d")
+        now_ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        all_sd = []
+
+        article_sd = {
             "@context": "https://schema.org",
             "@type": "Article",
             "headline": seo.title,
             "description": seo.description,
             "author": {"@type": "Organization", "name": seo.author},
             "inLanguage": seo.language,
-            "datePublished": datetime.now().strftime("%Y-%m-%d"),
-            "dateModified": datetime.now().strftime("%Y-%m-%d"),
+            "datePublished": now_str,
+            "dateModified": now_str,
             "keywords": seo.keywords,
         }
         total_users = summary.get("total_users", 0)
         total_cohorts = summary.get("total_cohorts", 0)
         if total_users or total_cohorts:
-            sd["about"] = {
+            article_sd["about"] = {
                 "@type": "Dataset",
                 "name": "留存分析数据",
                 "description": f"包含 {total_cohorts} 个队列，共 {total_users} 个用户的留存分析数据",
                 "variableMeasured": ["用户留存率", "队列规模", "漏斗转化率"],
             }
+        all_sd.append(article_sd)
+
+        breadcrumb_sd = {
+            "@context": "https://schema.org",
+            "@type": "BreadcrumbList",
+            "itemListElement": [
+                {"@type": "ListItem", "position": 1, "name": "首页", "item": seo.canonical_url or "/"},
+                {"@type": "ListItem", "position": 2, "name": "分析报告", "item": (seo.canonical_url or "") + "/reports"},
+                {"@type": "ListItem", "position": 3, "name": seo.title},
+            ],
+        }
+        all_sd.append(breadcrumb_sd)
+
+        org_sd = {
+            "@context": "https://schema.org",
+            "@type": "Organization",
+            "name": seo.author,
+        }
+        all_sd.append(org_sd)
+
+        webpage_sd = {
+            "@context": "https://schema.org",
+            "@type": "WebPage",
+            "name": seo.title,
+            "description": seo.description,
+            "inLanguage": seo.language,
+            "dateModified": now_ts,
+            "author": {"@type": "Organization", "name": seo.author},
+        }
+        if seo.canonical_url:
+            webpage_sd["url"] = seo.canonical_url
+            webpage_sd["potentialAction"] = {
+                "@type": "ReadAction",
+                "target": seo.canonical_url,
+            }
+        all_sd.append(webpage_sd)
+
         import json as _json
-        escaped = _json.dumps(sd, ensure_ascii=False).replace("</script>", "<\\/script>")
-        return f'<script type="application/ld+json">{escaped}</script>'
+        parts = []
+        for sd in all_sd:
+            escaped = _json.dumps(sd, ensure_ascii=False).replace("</script>", "<\\/script>")
+            parts.append(f'<script type="application/ld+json">{escaped}</script>')
+        return "\n".join(parts)
 
     def generate(self, result: CohortAnalysisResult) -> str:
         matrix = result.matrix
